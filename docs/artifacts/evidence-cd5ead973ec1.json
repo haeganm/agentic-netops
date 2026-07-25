@@ -1,0 +1,87 @@
+﻿{
+  "incident_id": "cd5ead973ec1",
+  "status": "RESOLVED",
+  "fault_class": "sg-ingress-removed",
+  "created_at": "2026-07-25T00:57:53Z",
+  "resolved_at": "2026-07-25T01:00:05.767Z",
+  "mttr_s": 132,
+  "ledger_entries": 10,
+  "controls": {
+    "change_authorized": {
+      "tier": "LOW",
+      "tier_reasons": [
+        "all ops additive/restorative; single-resource; oracles clean"
+      ],
+      "approvals": [],
+      "authorized_by": "policy (auto-execute, veto window)",
+      "other_decisions": []
+    },
+    "least_privilege": {
+      "remediation_via_scoped_sts": true,
+      "session_policy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "ec2:AuthorizeSecurityGroupIngress",
+            "Resource": [
+              "arn:aws:ec2:us-east-1:559007813069:security-group/sg-0d77ac8b4008246c4"
+            ]
+          },
+          {
+            "Effect": "Allow",
+            "Action": "ec2:Describe*",
+            "Resource": "*"
+          }
+        ]
+      },
+      "applied_operations": [
+        {
+          "action": "authorize_security_group_ingress",
+          "result": "ok"
+        }
+      ]
+    },
+    "verified": {
+      "intent": [
+        {
+          "stage": "PROVE",
+          "diff_count": 1
+        },
+        {
+          "stage": "VERIFY",
+          "diff_count": 0
+        }
+      ],
+      "intent_cfn": [
+        {
+          "stack_drift": "DRIFTED"
+        }
+      ],
+      "impact_reachable": {
+        "MEASURE": false,
+        "VERIFY": true
+      },
+      "data_plane": [],
+      "verification_scope": "full"
+    },
+    "human_oversight": {
+      "tier": "LOW",
+      "drift_actor": "arn:aws:iam::559007813069:user/haegan-admin",
+      "approvers": [],
+      "sod_enforced": false,
+      "two_party": false
+    },
+    "within_policy": {
+      "policy_version": "2.0.0",
+      "gate_verdict": "PASS",
+      "violations": []
+    },
+    "tamper_evident": {
+      "valid": true,
+      "length": 10,
+      "head": "ae492236b06f89ff586e6d5cf82c0c28f86a3442f45291a44a0f4baf3e955acf",
+      "first_break_seq": null
+    }
+  }
+}
