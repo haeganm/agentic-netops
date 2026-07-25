@@ -1,0 +1,21 @@
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+extend-exclude = [".aws-sam", ".venv"]
+
+[tool.ruff.lint]
+# BLE is enabled deliberately: broad excepts in this codebase are a documented policy
+# (see docs/conventions.md) and every one must carry an explicit `# noqa: BLE001`, which
+# turns each into a reviewable decision instead of an accident. Without BLE enabled those
+# noqa comments were decorative.
+select = ["E", "F", "W", "I", "B", "BLE", "UP", "SIM", "RUF"]
+ignore = [
+  "E501",    # line length is enforced by the formatter budget above, not per-line nags
+  "B008",    # boto3 clients built in call position are fine here
+]
+
+[tool.ruff.lint.per-file-ignores]
+# tests intentionally reach into private helpers and build long fixture literals
+"tests/*" = ["BLE001"]
+# scripts run as __main__ and set sys.path before importing shared/ -- E402 is inherent
+"scripts/*" = ["E402"]

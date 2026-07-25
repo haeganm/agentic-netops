@@ -1,0 +1,33 @@
+# CI with deliberately ZERO cloud credentials: lint, tests (moto-mocked), template validation.
+# Deploys are local-only by design; see docs/adr for the reasoning.
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: ruff
+        run: python -m ruff check src scripts tests
+      - name: pytest
+        run: python -m pytest -q
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+      - name: cfn-lint lab template
+        run: cfn-lint lab/template.yaml
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - name: sam validate
+        run: sam validate --lint
+        env:
+          SAM_CLI_TELEMETRY: "0"

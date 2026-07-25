@@ -1,0 +1,1 @@
+# Runtime deps for sam build. boto3 is provided by the Lambda runtime; nothing else needed.

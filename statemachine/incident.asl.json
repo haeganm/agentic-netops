@@ -1,0 +1,540 @@
+{
+  "Comment": "The closed loop: DETECT(upstream) -> PROVE -> MEASURE -> GENERATE-REPAIR -> APPROVE -> EXECUTE -> VERIFY",
+  "StartAt": "MarkProving",
+  "States": {
+    "MarkProving": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Status transition. Retried: the table is PROVISIONED, so a throttle here would otherwise strand the incident in a non-terminal state forever.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "PROVING"}}
+      },
+      "ResultPath": null,
+      "Next": "Prove"
+    },
+    "Prove": {
+      "Type": "Task",
+      "Resource": "${ProveFunctionArn}",
+      "Parameters": {"mode": "prove", "incident_id.$": "$.incident_id"},
+      "ResultPath": "$.prove",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "FalsePositive?"
+    },
+    "FalsePositive?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.prove.diff_count", "NumericEquals": 0, "Next": "CloseFalsePositive"}],
+      "Default": "DriftStart"
+    },
+    "CloseFalsePositive": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Status transition. Retried: the table is PROVISIONED, so a throttle here would otherwise strand the incident in a non-terminal state forever.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s, resolved_at = :t",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "FALSE_POSITIVE"}, ":t": {"S.$": "$$.State.EnteredTime"}}
+      },
+      "ResultPath": null,
+      "Next": "AnchorLedger"
+    },
+    "DriftStart": {
+      "Type": "Task",
+      "Resource": "${OraclesFunctionArn}",
+      "Parameters": {"op": "drift_start", "incident_id.$": "$.incident_id"},
+      "ResultPath": "$.drift",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.drift", "Next": "Diagnose"}],
+      "Next": "WaitDrift"
+    },
+    "WaitDrift": {"Type": "Wait", "Seconds": 15, "Next": "DriftPoll"},
+    "DriftPoll": {
+      "Type": "Task",
+      "Resource": "${OraclesFunctionArn}",
+      "Parameters": {"op": "drift_poll", "incident_id.$": "$.incident_id", "id.$": "$.drift.id", "polls.$": "$.drift.polls"},
+      "ResultPath": "$.drift",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.drift", "Next": "Diagnose"}],
+      "Next": "DriftDone?"
+    },
+    "DriftDone?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.drift.done", "BooleanEquals": true, "Next": "Diagnose"}],
+      "Default": "WaitDrift"
+    },
+    "Diagnose": {
+      "Type": "Task",
+      "Resource": "${DiagnoseFunctionArn}",
+      "Parameters": {"incident_id.$": "$.incident_id", "diff.$": "$.prove.diff", "fault_class.$": "$.prove.fault_class"},
+      "ResultPath": "$.diagnosis",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.diagnosis", "Next": "NeedRa?"}],
+      "Next": "NeedRa?"
+    },
+    "NeedRa?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.prove.oracles.ra_path", "IsNull": true, "Next": "NeedProbe?"}],
+      "Default": "RaStart"
+    },
+    "RaStart": {
+      "Type": "Task",
+      "Resource": "${OraclesFunctionArn}",
+      "Parameters": {"op": "ra_start", "incident_id.$": "$.incident_id", "path_key.$": "$.prove.oracles.ra_path", "stage": "MEASURE"},
+      "ResultPath": "$.ra",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.ra", "Next": "NeedProbe?"}],
+      "Next": "RaDoneImmediate?"
+    },
+    "RaDoneImmediate?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.ra.done", "BooleanEquals": true, "Next": "NeedProbe?"}],
+      "Default": "WaitRa"
+    },
+    "WaitRa": {"Type": "Wait", "Seconds": 20, "Next": "RaPoll"},
+    "RaPoll": {
+      "Type": "Task",
+      "Resource": "${OraclesFunctionArn}",
+      "Parameters": {"op": "ra_poll", "incident_id.$": "$.incident_id", "id.$": "$.ra.id", "path_key.$": "$.ra.path_key", "polls.$": "$.ra.polls", "stage": "MEASURE"},
+      "ResultPath": "$.ra",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.ra", "Next": "NeedProbe?"}],
+      "Next": "RaDone?"
+    },
+    "RaDone?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.ra.done", "BooleanEquals": true, "Next": "NeedProbe?"}],
+      "Default": "WaitRa"
+    },
+    "NeedProbe?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.prove.oracles.probe", "BooleanEquals": true, "Next": "RunProbe"}],
+      "Default": "GenerateRepair"
+    },
+    "RunProbe": {
+      "Type": "Task",
+      "Resource": "${ProbeFunctionArn}",
+      "Parameters": {},
+      "ResultPath": "$.probe",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.probe", "Next": "GenerateRepair"}],
+      "Next": "RecordProbe"
+    },
+    "RecordProbe": {
+      "Type": "Task",
+      "Resource": "${OraclesFunctionArn}",
+      "Parameters": {"op": "probe_record", "incident_id.$": "$.incident_id", "verdict.$": "$.probe", "stage": "MEASURE"},
+      "ResultPath": null,
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.probe_rec_err", "Next": "GenerateRepair"}],
+      "Next": "GenerateRepair"
+    },
+    "GenerateRepair": {
+      "Type": "Task",
+      "Resource": "${PlannerFunctionArn}",
+      "Parameters": {"incident_id.$": "$.incident_id", "diff.$": "$.prove.diff", "diagnosis.$": "$.diagnosis"},
+      "ResultPath": "$.plan",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "GateOk?"
+    },
+    "GateOk?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.plan.gate", "StringEquals": "PASS", "Next": "TierRouter"}],
+      "Default": "MarkGateBlocked"
+    },
+    "TierRouter": {
+      "Type": "Choice",
+      "Comment": "Autonomy tier routing (ADR 0011). LOW gets the auto-execute veto window; MEDIUM and HIGH SHARE this first human approval -- HIGH's second party is decided later, at SecondPartyNeeded?, once the first approval returns. A missing tier fails closed to human approval (a Choice on an absent path would otherwise raise uncatchable States.Runtime).",
+      "Choices": [
+        {"Variable": "$.plan.tier", "IsPresent": false, "Next": "NotifyApprover"},
+        {"Variable": "$.plan.tier", "StringEquals": "LOW", "Next": "NotifyVeto"}
+      ],
+      "Default": "NotifyApprover"
+    },
+    "NotifyVeto": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "netops incident auto-executing (LOW tier)",
+        "Message.$": "States.Format('Incident {} ({}) is a low-risk restore; auto-executing in ~60s unless cancelled in the console.', $.incident_id, $.prove.fault_class)"
+      },
+      "ResultPath": null,
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_err", "Next": "VetoWindow"}],
+      "Next": "VetoWindow"
+    },
+    "VetoWindow": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Comment": "Human decision point. Retry covers Lambda service errors on the token-store INVOKE only -- deliberately NOT States.TaskFailed, which is how a Reject/Cancel arrives and must never be retried.",
+      "Retry": [{"ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Parameters": {
+        "FunctionName": "${GovernanceFunctionArn}",
+        "Payload": {
+          "op": "store_token",
+          "incident_id.$": "$.incident_id",
+          "token.$": "$$.Task.Token",
+          "wait_status": "AUTO_EXEC_PENDING",
+          "deadline_seconds": 60,
+          "entered_at.$": "$$.State.EnteredTime",
+          "gate.$": "$.plan.gate"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.approval",
+      "Catch": [
+        {"ErrorEquals": ["States.Timeout"], "ResultPath": "$.veto", "Next": "MarkExecuting"},
+        {"ErrorEquals": ["Cancelled"], "ResultPath": "$.error", "Next": "MarkCancelled"},
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}
+      ],
+      "Next": "MarkExecuting"
+    },
+    "MarkCancelled": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Status transition. Retried: the table is PROVISIONED, so a throttle here would otherwise strand the incident in a non-terminal state forever.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s, resolved_at = :t REMOVE task_token",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "CANCELLED"}, ":t": {"S.$": "$$.State.EnteredTime"}}
+      },
+      "ResultPath": null,
+      "Next": "AnchorLedger"
+    },
+    "MarkGateBlocked": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Status transition. Retried: the table is PROVISIONED, so a throttle here would otherwise strand the incident in a non-terminal state forever.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "GATE_BLOCKED"}}
+      },
+      "ResultPath": null,
+      "Next": "FailGate"
+    },
+    "FailGate": {"Type": "Fail", "Error": "GateBlocked", "Cause": "remediation plan failed the policy gate"},
+    "NotifyApprover": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "netops incident awaiting approval",
+        "Message.$": "States.Format('Incident {} ({}) has a gate-passed remediation plan awaiting approval in the console.', $.incident_id, $.prove.fault_class)"
+      },
+      "ResultPath": null,
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_err", "Next": "WaitForApproval"}],
+      "Next": "WaitForApproval"
+    },
+    "WaitForApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Comment": "Human decision point. Retry covers Lambda service errors on the token-store INVOKE only -- deliberately NOT States.TaskFailed, which is how a Reject/Cancel arrives and must never be retried.",
+      "Retry": [{"ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Parameters": {
+        "FunctionName": "${GovernanceFunctionArn}",
+        "Payload": {
+          "op": "store_token",
+          "incident_id.$": "$.incident_id",
+          "token.$": "$$.Task.Token",
+          "gate.$": "$.plan.gate"
+        }
+      },
+      "TimeoutSeconds": 86400,
+      "ResultPath": "$.approval",
+      "Catch": [
+        {"ErrorEquals": ["States.Timeout"], "ResultPath": "$.error", "Next": "MarkExpired"},
+        {"ErrorEquals": ["Rejected"], "ResultPath": "$.error", "Next": "MarkRejected"},
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}
+      ],
+      "Next": "SecondPartyNeeded?"
+    },
+    "SecondPartyNeeded?": {
+      "Type": "Choice",
+      "Comment": "Two-party control (ADR 0013): only HIGH tier requires a SECOND, distinct approver. A missing tier fails closed to executing with the one approval already given.",
+      "Choices": [
+        {"Variable": "$.plan.tier", "IsPresent": false, "Next": "MarkExecuting"},
+        {"Variable": "$.plan.tier", "StringEquals": "HIGH", "Next": "NotifySecondApprover"}
+      ],
+      "Default": "MarkExecuting"
+    },
+    "NotifySecondApprover": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "netops incident needs a SECOND approver (HIGH tier)",
+        "Message.$": "States.Format('Incident {} ({}) had its first approval; a DISTINCT second operator must approve in the console (two-party control).', $.incident_id, $.prove.fault_class)"
+      },
+      "ResultPath": null,
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.notify_err", "Next": "WaitForSecondApproval"}],
+      "Next": "WaitForSecondApproval"
+    },
+    "WaitForSecondApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Comment": "Human decision point. Retry covers Lambda service errors on the token-store INVOKE only -- deliberately NOT States.TaskFailed, which is how a Reject/Cancel arrives and must never be retried.",
+      "Retry": [{"ErrorEquals": ["Lambda.TooManyRequestsException", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Parameters": {
+        "FunctionName": "${GovernanceFunctionArn}",
+        "Payload": {
+          "op": "store_token",
+          "incident_id.$": "$.incident_id",
+          "token.$": "$$.Task.Token",
+          "wait_status": "AWAITING_SECOND_APPROVAL",
+          "gate.$": "$.plan.gate"
+        }
+      },
+      "TimeoutSeconds": 86400,
+      "ResultPath": "$.approval2",
+      "Catch": [
+        {"ErrorEquals": ["States.Timeout"], "ResultPath": "$.error", "Next": "MarkExpired"},
+        {"ErrorEquals": ["Rejected"], "ResultPath": "$.error", "Next": "MarkRejected"},
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}
+      ],
+      "Next": "MarkExecuting"
+    },
+    "MarkExpired": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Status transition. Retried: the table is PROVISIONED, so a throttle here would otherwise strand the incident in a non-terminal state forever.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s REMOVE task_token",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "EXPIRED"}}
+      },
+      "ResultPath": null,
+      "Next": "AnchorLedger"
+    },
+    "MarkRejected": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Status transition. Retried: the table is PROVISIONED, so a throttle here would otherwise strand the incident in a non-terminal state forever.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s REMOVE task_token",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "REJECTED"}}
+      },
+      "ResultPath": null,
+      "Next": "AnchorLedger"
+    },
+    "MarkExecuting": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Status transition. Retried: the table is PROVISIONED, so a throttle here would otherwise strand the incident in a non-terminal state forever.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s REMOVE task_token",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "EXECUTING"}}
+      },
+      "ResultPath": null,
+      "Next": "Execute"
+    },
+    "Execute": {
+      "Type": "Task",
+      "Resource": "${ExecutorFunctionArn}",
+      "Parameters": {"incident_id.$": "$.incident_id", "ops.$": "$.plan.ops"},
+      "ResultPath": "$.exec",
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "Verify"
+    },
+    "Verify": {
+      "Type": "Task",
+      "Resource": "${ProveFunctionArn}",
+      "Parameters": {"mode": "verify", "incident_id.$": "$.incident_id"},
+      "ResultPath": "$.verify",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "VerifyClean?"
+    },
+    "VerifyClean?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.verify.diff_count", "NumericEquals": 0, "Next": "NeedReRa?"}],
+      "Default": "MarkFailed"
+    },
+    "NeedReRa?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.prove.oracles.ra_path", "IsNull": true, "Next": "NeedReProbe?"}],
+      "Default": "ReRaStart"
+    },
+    "ReRaStart": {
+      "Type": "Task",
+      "Resource": "${OraclesFunctionArn}",
+      "Parameters": {"op": "ra_start", "incident_id.$": "$.incident_id", "path_key.$": "$.prove.oracles.ra_path", "stage": "VERIFY"},
+      "ResultPath": "$.rera",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.rera", "Next": "NeedReProbe?"}],
+      "Next": "ReRaDoneImmediate?"
+    },
+    "ReRaDoneImmediate?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.rera.done", "BooleanEquals": true, "Next": "NeedReProbe?"}],
+      "Default": "WaitReRa"
+    },
+    "WaitReRa": {"Type": "Wait", "Seconds": 20, "Next": "ReRaPoll"},
+    "ReRaPoll": {
+      "Type": "Task",
+      "Resource": "${OraclesFunctionArn}",
+      "Parameters": {"op": "ra_poll", "incident_id.$": "$.incident_id", "id.$": "$.rera.id", "path_key.$": "$.rera.path_key", "polls.$": "$.rera.polls", "stage": "VERIFY"},
+      "ResultPath": "$.rera",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.rera", "Next": "NeedReProbe?"}],
+      "Next": "ReRaDone?"
+    },
+    "ReRaDone?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.rera.done", "BooleanEquals": true, "Next": "ReRaHealthy?"}],
+      "Default": "WaitReRa"
+    },
+    "ReRaHealthy?": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.rera.started", "BooleanEquals": false, "Next": "NeedReProbe?"},
+        {"Variable": "$.rera.reachable", "BooleanEquals": true, "Next": "NeedReProbe?"}
+      ],
+      "Default": "MarkFailed"
+    },
+    "NeedReProbe?": {
+      "Type": "Choice",
+      "Choices": [{"Variable": "$.prove.oracles.probe", "BooleanEquals": true, "Next": "RunReProbe"}],
+      "Default": "VerificationScope?"
+    },
+    "RunReProbe": {
+      "Type": "Task",
+      "Resource": "${ProbeFunctionArn}",
+      "Parameters": {},
+      "ResultPath": "$.reprobe",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "RecordReProbe"
+    },
+    "RecordReProbe": {
+      "Type": "Task",
+      "Resource": "${OraclesFunctionArn}",
+      "Parameters": {"op": "probe_record", "incident_id.$": "$.incident_id", "verdict.$": "$.reprobe", "stage": "VERIFY"},
+      "ResultPath": "$.reprobe_rec",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "MarkFailed"}],
+      "Next": "ReProbeHealthy?"
+    },
+    "ReProbeHealthy?": {
+      "Type": "Choice",
+      "Choices": [{
+        "And": [
+          {"Variable": "$.reprobe_rec.dns", "StringEquals": "pass"},
+          {"Variable": "$.reprobe_rec.tcp", "StringEquals": "pass"}
+        ],
+        "Next": "VerificationScope?"
+      }],
+      "Default": "MarkFailed"
+    },
+    "VerificationScope?": {
+      "Type": "Choice",
+      "Comment": "The repair is proven converged either way; this records HOW COMPLETELY it was verified. If an applicable Reachability Analyzer check was skipped (budget cap, ADR 0005) or timed out inconclusive, the incident closes VERIFICATION_LIMITED rather than claiming full verification.",
+      "Choices": [
+        {"And": [{"Variable": "$.rera.started", "IsPresent": true},
+                 {"Variable": "$.rera.started", "BooleanEquals": false}], "Next": "CloseLimited"},
+        {"And": [{"Variable": "$.ra.started", "IsPresent": true},
+                 {"Variable": "$.ra.started", "BooleanEquals": false}], "Next": "CloseLimited"}
+      ],
+      "Default": "Close"
+    },
+    "CloseLimited": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Resolved, but with an applicable impact check skipped/inconclusive -- never silently reported as fully verified.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s, resolved_at = :t, verification = :v",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "VERIFICATION_LIMITED"}, ":t": {"S.$": "$$.State.EnteredTime"}, ":v": {"S": "LIMITED"}}
+      },
+      "ResultPath": null,
+      "Next": "AnchorLedger"
+    },
+    "Close": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Status transition. Retried: the table is PROVISIONED, so a throttle here would otherwise strand the incident in a non-terminal state forever.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s, resolved_at = :t",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "RESOLVED"}, ":t": {"S.$": "$$.State.EnteredTime"}}
+      },
+      "ResultPath": null,
+      "Next": "AnchorLedger"
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Comment": "Status transition. Retried: the table is PROVISIONED, so a throttle here would otherwise strand the incident in a non-terminal state forever.",
+      "Retry": [{"ErrorEquals": ["DynamoDB.ThrottlingException", "DynamoDB.ProvisionedThroughputExceededException", "DynamoDB.InternalServerError", "States.TaskFailed"], "IntervalSeconds": 2, "MaxAttempts": 4, "BackoffRate": 2}],
+      "Parameters": {
+        "TableName": "${TableName}",
+        "Key": {"pk": {"S.$": "States.Format('INCIDENT#{}', $.incident_id)"}, "sk": {"S": "META"}},
+        "UpdateExpression": "SET #s = :s REMOVE task_token",
+        "ExpressionAttributeNames": {"#s": "status"},
+        "ExpressionAttributeValues": {":s": {"S": "FAILED"}}
+      },
+      "ResultPath": null,
+      "Next": "AnchorLedgerOnFail"
+    },
+    "AnchorLedger": {
+      "Type": "Task",
+      "Resource": "${GovernanceFunctionArn}",
+      "Comment": "Tamper-evidence anchor (ADR 0014): records the decision-ledger hash-chain head on the incident AND publishes it out of band via SNS. Out-of-band is the point -- a role with table write access could rewrite the entries and the head consistently, so an emailed copy of the head is what makes later tampering detectable. Also stamps mttr_s.",
+      "Parameters": {"op": "anchor_ledger", "incident_id.$": "$.incident_id"},
+      "ResultPath": "$.anchor",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.anchor_err", "Next": "AnchorSkipped"}],
+      "End": true
+    },
+    "AnchorLedgerOnFail": {
+      "Type": "Task",
+      "Resource": "${GovernanceFunctionArn}",
+      "Comment": "Anchor a FAILED incident too -- a failed remediation attempt is exactly the history an attacker would want to erase.",
+      "Parameters": {"op": "anchor_ledger", "incident_id.$": "$.incident_id"},
+      "ResultPath": "$.anchor",
+      "Retry": [{"ErrorEquals": ["States.TaskFailed"], "IntervalSeconds": 3, "MaxAttempts": 2, "BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"], "ResultPath": "$.anchor_err", "Next": "FailState"}],
+      "Next": "FailState"
+    },
+    "AnchorSkipped": {
+      "Type": "Pass",
+      "Comment": "Anchoring is best-effort: the chain itself is already durable in the table, so a failure to publish the out-of-band copy must not fail an otherwise-resolved incident.",
+      "End": true
+    },
+    "FailState": {"Type": "Fail", "Error": "IncidentFailed", "Cause": "see incident ledger"}
+  }
+}

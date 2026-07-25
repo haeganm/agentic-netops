@@ -1,0 +1,18 @@
+# Local parity: DynamoDB Local (ledger/config) + Ollama (diagnosis). No LocalStack --
+# EventBridge/SFN/Reachability Analyzer/EC2 mutation are cloud-verified per build phase.
+services:
+  dynamodb:
+    image: amazon/dynamodb-local
+    command: -jar DynamoDBLocal.jar -inMemory -sharedDb
+    ports:
+      - "8000:8000"
+
+  ollama:
+    image: ollama/ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+volumes:
+  ollama:

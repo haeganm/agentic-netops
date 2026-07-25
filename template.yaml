@@ -1,0 +1,836 @@
+# Agentic NetOps platform stack. Grows phase by phase; the lab network lives in
+# lab/template.yaml (separate stack) so platform redeploys never disturb the drift target.
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Agentic NetOps platform (closed-loop network remediation)
+
+Parameters:
+  AlertEmail:
+    Type: String
+    Description: Email for budget alerts and approval notifications
+  ModelId:
+    Type: String
+    Default: us.amazon.nova-micro-v1:0
+    Description: Bedrock model id. Changed only via scripts/release_model.ps1 (eval-gated).
+  LabPrivateSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Lab private subnet (netops-lab stack output) the probe runs in
+  ProbeSgId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Probe security group (netops-lab stack output)
+  LabVpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Lab VPC id (netops-lab stack output) - scopes ModifyVpcAttribute remediation
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 512
+    Timeout: 60
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref NetopsTable
+        ACCOUNT_ID: !Ref AWS::AccountId  # evidence export recomputes the scoped session policy
+
+Resources:
+  # Single definition of "a runtime function's table access": read anything, write ONLY
+  # INCIDENT#* items. ADR 0010 calls that LeadingKeys condition critical -- it was previously
+  # copy-pasted into seven function policies, i.e. seven chances to fumble it. Functions that
+  # need more (the RA counter, StartExecution, SendTask*) add their own extra statements.
+  NetopsTableAccess:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Read the netops table; write only INCIDENT#* items (ADR 0010)
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [dynamodb:GetItem, dynamodb:Query]
+            Resource:
+              - !GetAtt NetopsTable.Arn
+              - !Sub ${NetopsTable.Arn}/index/GSI1
+          - Effect: Allow
+            Action: [dynamodb:PutItem, dynamodb:UpdateItem]
+            Resource: !GetAtt NetopsTable.Arn
+            Condition:
+              ForAllValues:StringLike:
+                dynamodb:LeadingKeys: ["INCIDENT#*"]
+
+  NetopsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PROVISIONED
+      ProvisionedThroughput: {ReadCapacityUnits: 3, WriteCapacityUnits: 3}
+      # system-of-record: incidents + the "full replayability" ledger + baseline
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      DeletionProtectionEnabled: true
+      AttributeDefinitions:
+        - {AttributeName: pk, AttributeType: S}
+        - {AttributeName: sk, AttributeType: S}
+        - {AttributeName: gsi1pk, AttributeType: S}
+        - {AttributeName: gsi1sk, AttributeType: S}
+      KeySchema:
+        - {AttributeName: pk, KeyType: HASH}
+        - {AttributeName: sk, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - {AttributeName: gsi1pk, KeyType: HASH}
+            - {AttributeName: gsi1sk, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+          ProvisionedThroughput: {ReadCapacityUnits: 1, WriteCapacityUnits: 1}
+
+  # ---- DETECT: CloudTrail mgmt events -> EventBridge -> SQS (30s batch = debounce) -> detector
+  ChangeQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      VisibilityTimeout: 120
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt ChangeDLQ.Arn
+        maxReceiveCount: 3
+
+  ChangeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 604800
+
+  ChangeQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref ChangeQueue]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: events.amazonaws.com}
+            Action: sqs:SendMessage
+            Resource: !GetAtt ChangeQueue.Arn
+            Condition:
+              ArnEquals: {aws:SourceArn: !GetAtt ChangeEventsRule.Arn}
+
+  ChangeEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Lab-relevant EC2 network mutations (CloudTrail mgmt events, free)
+      EventPattern:
+        source: [aws.ec2]
+        detail-type: [AWS API Call via CloudTrail]
+        detail:
+          eventName:
+            - AuthorizeSecurityGroupIngress
+            - AuthorizeSecurityGroupEgress
+            - RevokeSecurityGroupIngress
+            - RevokeSecurityGroupEgress
+            - ModifySecurityGroupRules
+            - CreateRoute
+            - DeleteRoute
+            - ReplaceRoute
+            - CreateNetworkAclEntry
+            - DeleteNetworkAclEntry
+            - ReplaceNetworkAclEntry
+            - ReplaceRouteTableAssociation
+            - DisassociateRouteTable
+            - ModifyNetworkInterfaceAttribute
+            - ModifyVpcAttribute
+      Targets:
+        - Id: change-queue
+          Arn: !GetAtt ChangeQueue.Arn
+
+  DetectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: functions.detector.handler.lambda_handler
+      Timeout: 30
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref IncidentStateMachine
+          REMEDIATION_ROLE_ARN: !GetAtt RemediationRole.Arn
+      Events:
+        Changes:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ChangeQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 30
+            FunctionResponseTypes: [ReportBatchItemFailures]
+      Policies:
+        - !Ref NetopsTableAccess
+        - Statement:
+            - Effect: Allow
+              Action: states:StartExecution
+              Resource: !Ref IncidentStateMachine
+
+  DetectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${DetectorFunction}
+      RetentionInDays: 7
+
+  # CloudTrail is required for "AWS API Call via CloudTrail" EventBridge events
+  # (verified empirically: no trail -> no events). Write-only mgmt events, first
+  # trail copy is free; 1-day S3 lifecycle so nothing accrues.
+  TrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - {Id: expire-fast, Status: Enabled, ExpirationInDays: 1}
+
+  TrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref TrailBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt TrailBucket.Arn
+          - Effect: Allow
+            Principal: {Service: cloudtrail.amazonaws.com}
+            Action: s3:PutObject
+            Resource: !Sub ${TrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+            Condition:
+              StringEquals: {s3:x-amz-acl: bucket-owner-full-control}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt TrailBucket.Arn
+              - !Sub ${TrailBucket.Arn}/*
+            Condition:
+              Bool: {aws:SecureTransport: false}
+
+  ChangeTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: TrailBucketPolicy
+    Properties:
+      IsLogging: true
+      S3BucketName: !Ref TrailBucket
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: false
+      EnableLogFileValidation: true  # digest chain -> log tampering is detectable
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          IncludeManagementEvents: true
+
+  # ---- guardrails
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - {Protocol: email, Endpoint: !Ref AlertEmail}
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: netops-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: 10, Unit: USD}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 20}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: 100}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+
+  ChangeDLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: change events dead-lettered - detector is failing
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions: [{Name: QueueName, Value: !GetAtt ChangeDLQ.QueueName}]
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  # ---- console identity + API
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      # TOTP MFA available (OPTIONAL keeps the one-step demo login working; enforce
+      # per-user or flip to ON to require it on the approve/execute console). SECURITY.md.
+      MfaConfiguration: OPTIONAL
+      EnabledMfas: [SOFTWARE_TOKEN_MFA]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      WriteAttributes: [email]
+      ReadAttributes: [email]
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 5
+        ThrottlingRateLimit: 2
+      CorsConfiguration:
+        AllowOrigins: [!Sub "https://${UiDistribution.DomainName}"]
+        AllowHeaders: [Authorization, Content-Type]
+        AllowMethods: [GET, POST, OPTIONS]
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience: [!Ref UserPoolClient]
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: functions.api.handler.lambda_handler
+      Timeout: 15
+      Events:
+        ListIncidents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /incidents
+            Method: GET
+        GetIncident:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/incidents/{id}"
+            Method: GET
+        Approve:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/incidents/{id}/approve"
+            Method: POST
+        Reject:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/incidents/{id}/reject"
+            Method: POST
+        Cancel:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/incidents/{id}/cancel"
+            Method: POST
+        Verify:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/incidents/{id}/verify"
+            Method: GET
+        Evidence:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: "/incidents/{id}/evidence"
+            Method: GET
+        Evals:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /evals
+            Method: GET
+        Limits:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /limits
+            Method: GET
+      Policies:
+        - !Ref NetopsTableAccess
+        - Statement:
+            # SendTask* act on a callback TOKEN, not on a state-machine resource: AWS requires
+            # Resource "*" and supports narrowing via the states:StateMachineArn condition key.
+            - Effect: Allow
+              Action: [states:SendTaskSuccess, states:SendTaskFailure]
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  states:StateMachineArn: !Ref IncidentStateMachine
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ApiFunction}
+      RetentionInDays: 7
+
+  # ---- console hosting (CloudFront + private S3, v1 pattern)
+  UiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-ui-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  UiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UiBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub ${UiBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${UiDistribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt UiBucket.Arn
+              - !Sub ${UiBucket.Arn}/*
+            Condition:
+              Bool: {aws:SecureTransport: false}
+
+  UiSecurityHeaders:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub ${AWS::StackName}-security-headers
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+          ContentTypeOptions: {Override: true}
+          FrameOptions: {FrameOption: DENY, Override: true}
+          ReferrerPolicy: {ReferrerPolicy: no-referrer, Override: true}
+
+  UiOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-ui-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  UiDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        Origins:
+          - Id: ui-s3
+            DomainName: !GetAtt UiBucket.RegionalDomainName
+            OriginAccessControlId: !Ref UiOriginAccessControl
+            S3OriginConfig: {OriginAccessIdentity: ''}
+        DefaultCacheBehavior:
+          TargetOriginId: ui-s3
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # AWS managed CachingOptimized
+          ResponseHeadersPolicyId: !Ref UiSecurityHeaders
+
+  # ---- the closed loop: PROVE -> MEASURE -> GENERATE-REPAIR -> APPROVE -> EXECUTE -> VERIFY
+  IncidentStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: STANDARD
+      DefinitionUri: statemachine/incident.asl.json
+      DefinitionSubstitutions:
+        TableName: !Ref NetopsTable
+        ProveFunctionArn: !GetAtt ProveFunction.Arn
+        DiagnoseFunctionArn: !GetAtt DiagnoseFunction.Arn
+        OraclesFunctionArn: !GetAtt OraclesFunction.Arn
+        GovernanceFunctionArn: !GetAtt GovernanceFunction.Arn
+        ProbeFunctionArn: !GetAtt ProbeFunction.Arn
+        PlannerFunctionArn: !GetAtt PlannerFunction.Arn
+        ExecutorFunctionArn: !GetAtt ExecutorFunction.Arn
+        AlertTopicArn: !Ref AlertTopic
+      Policies:
+        - LambdaInvokePolicy: {FunctionName: !Ref ProveFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref DiagnoseFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref OraclesFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref GovernanceFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref ProbeFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref PlannerFunction}
+        - LambdaInvokePolicy: {FunctionName: !Ref ExecutorFunction}
+        # native updateItem states touch INCIDENT#* only -- scoped, not CrudPolicy-broad
+        - Statement:
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt NetopsTable.Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys: ["INCIDENT#*"]
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt AlertTopic.TopicName}
+
+  ProveFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: functions.prove.handler.lambda_handler
+      Policies:
+        - !Ref NetopsTableAccess
+        - Statement:
+            - Effect: Allow
+              Action: [ec2:DescribeSecurityGroups, ec2:DescribeRouteTables, ec2:DescribeNetworkAcls,
+                       ec2:DescribeVpcAttribute, ec2:DescribeNetworkInterfaces]
+              Resource: "*"
+
+  DiagnoseFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: functions.diagnose.handler.lambda_handler
+      Timeout: 90
+      Environment:
+        Variables:
+          MODEL_PROVIDER: bedrock
+          MODEL_ID: !Ref ModelId
+      Policies:
+        - !Ref NetopsTableAccess
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                # Nova family only (region wildcard: cross-region profiles route to siblings).
+                # Blocks pricier non-Nova Amazon models; eval-gate still governs which Nova ships.
+                - arn:aws:bedrock:*::foundation-model/amazon.nova-*
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-*
+
+  OraclesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: functions.oracles.handler.lambda_handler
+      Environment:
+        Variables:
+          LAB_STACK: netops-lab
+      # Deliberate managed-policy exception (only one in the project): Reachability
+      # Analyzer's engine walks the graph with the CALLER's permissions and its required
+      # describe set spans many services and evolves - AWS owns that list, not us.
+      # (Verified: inline ec2:Describe* + tiros:* still fails "insufficient permissions".)
+      Policies:
+        - !Ref NetopsTableAccess
+        - arn:aws:iam::aws:policy/AmazonVPCReachabilityAnalyzerFullAccessPolicy
+        - Statement:
+            - Effect: Allow
+              Action: [cloudformation:DetectStackDrift, cloudformation:DetectStackResourceDrift,
+                       cloudformation:DescribeStackDriftDetectionStatus,
+                       cloudformation:DescribeStackResources, cloudformation:DescribeStacks]
+              Resource: "*"
+            # the ONLY runtime writer of the RA budget counter, scoped to its partition
+            - Effect: Allow
+              Action: dynamodb:UpdateItem
+              Resource: !GetAtt NetopsTable.Arn
+              Condition:
+                ForAllValues:StringLike:
+                  dynamodb:LeadingKeys: ["LIMITS#RA"]
+
+  # Governance plumbing (task tokens + tamper-evident ledger anchoring). Separate from the
+  # oracle functions ON PURPOSE: the code path that mediates every human approval must not
+  # carry Reachability-Analyzer read permissions. DDB is INCIDENT#*-scoped; SNS is the
+  # out-of-band anchor channel (ADR 0014).
+  GovernanceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: functions.governance.handler.lambda_handler
+      Environment:
+        Variables:
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+      Policies:
+        - !Ref NetopsTableAccess
+        - SNSPublishMessagePolicy: {TopicName: !GetAtt AlertTopic.TopicName}
+
+  PlannerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: functions.planner.handler.lambda_handler
+      Timeout: 90
+      Environment:
+        Variables:
+          MODEL_PROVIDER: bedrock
+          MODEL_ID: !Ref ModelId
+      Policies:
+        - !Ref NetopsTableAccess
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                # Nova family only (region wildcard: cross-region profiles route to siblings).
+                # Blocks pricier non-Nova Amazon models; eval-gate still governs which Nova ships.
+                - arn:aws:bedrock:*::foundation-model/amazon.nova-*
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-*
+
+  # ---- EXECUTE-stage governance: role AND boundary AND per-incident session policy
+  RemediationBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: Ceiling for netops remediation - lab-tagged EC2 network resources only
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # mutating actions permitted ONLY on resources tagged Project=agentic-netops
+          # (the lab). This is the hard ceiling: even a widened session policy or a
+          # compromised executor cannot touch an untagged production resource.
+          - Sid: MutateTaggedLabResources
+            Effect: Allow
+            Action:
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:AuthorizeSecurityGroupEgress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupEgress
+              - ec2:CreateRoute
+              - ec2:DeleteRoute
+              - ec2:ReplaceRoute
+              - ec2:CreateNetworkAclEntry
+              - ec2:DeleteNetworkAclEntry
+              - ec2:ReplaceRouteTableAssociation
+              - ec2:ReplaceNetworkAclAssociation
+              - ec2:ModifyNetworkInterfaceAttribute
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:ResourceTag/Project: agentic-netops
+                aws:RequestedRegion: !Ref AWS::Region
+          # ModifyVpcAttribute does not honor aws:ResourceTag -> scope to the lab VPC ARN
+          - Sid: ModifyLabVpcOnly
+            Effect: Allow
+            Action: ec2:ModifyVpcAttribute
+            Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${LabVpcId}
+            Condition:
+              StringEquals: {aws:RequestedRegion: !Ref AWS::Region}
+          - Sid: DescribeForAnalysis
+            Effect: Allow
+            Action: ec2:Describe*
+            Resource: "*"
+            Condition:
+              StringEquals: {aws:RequestedRegion: !Ref AWS::Region}
+
+  RemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !Ref RemediationBoundary
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {AWS: !GetAtt ExecutorFunctionRole.Arn}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: remediate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: MutateTaggedLabResources
+                Effect: Allow
+                Action:
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:CreateRoute
+                  - ec2:DeleteRoute
+                  - ec2:ReplaceRoute
+                  - ec2:CreateNetworkAclEntry
+                  - ec2:DeleteNetworkAclEntry
+                  - ec2:ReplaceRouteTableAssociation
+                  - ec2:ReplaceNetworkAclAssociation
+                  - ec2:ModifyNetworkInterfaceAttribute
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Project: agentic-netops
+                    aws:RequestedRegion: !Ref AWS::Region
+              - Sid: ModifyLabVpcOnly
+                Effect: Allow
+                Action: ec2:ModifyVpcAttribute
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${LabVpcId}
+                Condition:
+                  StringEquals: {aws:RequestedRegion: !Ref AWS::Region}
+              - Sid: DescribeForAnalysis
+                Effect: Allow
+                Action: ec2:Describe*
+                Resource: "*"
+                Condition:
+                  StringEquals: {aws:RequestedRegion: !Ref AWS::Region}
+
+  ExecutorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: functions.executor.handler.lambda_handler
+      Environment:
+        Variables:
+          REMEDIATION_ROLE_ARN: !GetAtt RemediationRole.Arn
+          ACCOUNT_ID: !Ref AWS::AccountId
+      Policies:
+        - !Ref NetopsTableAccess
+        - Statement:
+            # read-only: the pre-execute gate re-check snapshots live config (ADR 0004).
+            # Mutations still go only through the scoped RemediationRole, never this role.
+            - Effect: Allow
+              Action: ec2:Describe*
+              Resource: "*"
+
+  # sts:AssumeRole granted via a standalone policy to break the Role<->Function cycle
+  ExecutorAssumePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: assume-remediation-role
+      Roles: [!Ref ExecutorFunctionRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sts:AssumeRole
+            Resource: !GetAtt RemediationRole.Arn
+
+  ProveLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProveFunction}
+      RetentionInDays: 7
+  DiagnoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${DiagnoseFunction}
+      RetentionInDays: 7
+  OraclesLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${OraclesFunction}
+      RetentionInDays: 7
+  GovernanceLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${GovernanceFunction}
+      RetentionInDays: 7
+  PlannerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${PlannerFunction}
+      RetentionInDays: 7
+  ExecutorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ExecutorFunction}
+      RetentionInDays: 7
+
+  # RA budget exhaustion must never be silent (ADR 0005): a metric filter on the
+  # ra_skipped_budget log line drives an alarm so degraded verification is visible.
+  RaSkippedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref OraclesLogGroup
+      FilterPattern: '{ $.event = "ra_skipped_budget" }'
+      MetricTransformations:
+        - MetricNamespace: NetOps
+          MetricName: RaSkippedBudget
+          MetricValue: "1"
+          DefaultValue: 0
+
+  RaSkippedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: RA budget exhausted - incidents closing VERIFICATION_LIMITED
+      Namespace: NetOps
+      MetricName: RaSkippedBudget
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  IncidentSfnFailedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: incident workflow execution failed (incl. partial-apply / gate re-check)
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions: [{Name: StateMachineArn, Value: !Ref IncidentStateMachine}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
+  # Data-plane oracle: lives inside the lab private subnet, makes no AWS calls.
+  ProbeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/
+      Handler: functions.probe.handler.lambda_handler
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds: [!Ref ProbeSgId]
+        SubnetIds: [!Ref LabPrivateSubnetId]
+
+  ProbeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ProbeFunction}
+      RetentionInDays: 7
+
+Outputs:
+  TableName:
+    Value: !Ref NetopsTable
+  ProbeFunctionName:
+    Value: !Ref ProbeFunction
+  StateMachineArn:
+    Value: !Ref IncidentStateMachine
+  ApiUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  UiUrl:
+    Value: !Sub https://${UiDistribution.DomainName}
+  UiBucketName:
+    Value: !Ref UiBucket
+  UiDistributionId:
+    Value: !Ref UiDistribution
