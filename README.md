@@ -182,8 +182,60 @@ Operational switches:
 .venv\Scripts\python scripts\seed_baseline.py --autonomy manual   # kill-switch: no auto-execute
 .venv\Scripts\python scripts\seed_baseline.py --autonomy normal   # re-enable LOW-tier autonomy
 .venv\Scripts\python scripts\seed_baseline.py --mode maintenance  # suppress detection during a deploy
-.\scripts\teardown.ps1                                           # back to $0.00
 ```
+
+## Teardown and rebuild
+
+The platform is designed to live at **$0.00 idle**, but it can also be torn down completely
+between demos and rebuilt on demand.
+
+```powershell
+.\scripts\teardown.ps1          # empty buckets, drop deletion protection, delete all 3 stacks
+.\scripts\verify_teardown.ps1   # PROVE nothing is left that can bill (exit 0 = safe to walk away)
+```
+
+`teardown.ps1` fails loudly rather than reporting success optimistically — an earlier version
+printed `idle bill $0.00` unconditionally, even when both stack deletions had failed. The order it
+uses is not cosmetic: deletion protection must come off the table first, buckets must be emptied
+before CloudFormation will delete them (and SAM's artifact bucket is *versioned*, so noncurrent
+versions and delete markers have to go too), and the CloudFront distribution takes 15–25 minutes
+to disable and propagate — slow, not stuck.
+
+`verify_teardown.ps1` is the one that matters. It checks every resource class by name, then sweeps
+**ten regions** for the classes that actually cost real money — an orphaned Elastic IP is
+~$3.60/month and no name-based search would ever find it. It also asserts, as a *positive*, that a
+budget alarm survives: that's the tripwire if any of this is wrong. It deliberately never calls the
+Cost Explorer API, which bills $0.01 per request — a spend-checking tool should not be a line item
+on the bill it checks.
+
+**Rebuilding:**
+
+```powershell
+$env:NETOPS_ALERT_EMAIL = "you@example.com"
+.\scripts\restore.ps1 -OperatorPassword "<12+ chars>"          # lab + platform + seed + UI + 1 operator
+.\scripts\create_user.ps1 -Email opsB@x.com -Password "<...>"  # second operator: HIGH tier needs two
+.venv\Scripts\python scripts\seed_baseline.py --approver opsA@x.com=arn:aws:iam::<acct>:user/<you>
+```
+
+**What does not come back** — worth reading once so a rebuild holds no surprises:
+
+- **All incident and eval history.** The rebuilt system starts with an empty ledger. DynamoDB
+  point-in-time recovery does *not* survive the table, so `docs/artifacts/` holds the only
+  preserved copy (see the README there).
+- **The Reachability Analyzer counter resets to 0/30** — another $3 of headroom. The hard cap is
+  per *deployment*, not per project lifetime; `docs/costs.md` is the authoritative record of
+  cumulative spend.
+- **Two non-admin operators are required** for HIGH-tier two-party approval (ADR 0016), and
+  `restore.ps1` creates at most one. The `CONFIG#APPROVERS` map also needs its own `--approver`
+  run; a bare `seed_baseline.py` seeds an empty map and warns that segregation of duties cannot
+  fire.
+- **The SNS email subscription needs re-confirming by clicking the email**, or ledger-anchor
+  notifications silently never arrive.
+- Every generated identifier changes (API id, user pool id, table name, CloudFront domain).
+  Nothing in the repo hardcodes them — `ui/config.js` is generated at deploy — so no
+  documentation edits are needed.
+- `deploy_lab.ps1` calls `seed_baseline.py` before the platform stack exists, so a clean rebuild
+  prints two expected failure warnings. Harmless.
 
 Local parity, zero AWS: `.\scripts\dev.ps1` then
 `.venv\Scripts\python scripts\local_incident.py sg-ingress-removed [--ollama]` runs the
