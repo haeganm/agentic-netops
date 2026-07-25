@@ -27,6 +27,7 @@ depends on the LLM — a remediation failure is a platform bug, not a model regr
 | 2026-07-24 first pass | nova-micro | 9/9 | 6/9 | 5/9 | ~89s | 4 failures, two root causes (below) |
 | 2026-07-24 after fixes | nova-micro | 9/9 | 6/9 | **9/9** | ~85s | the 4 failed classes re-run green (77/70/97/77s) |
 | 2026-07-24 post-security-hardening | nova-micro | 9/9 | 6/9 | **9/9** | ~90s | regression after the audit remediation: the tag-scoped remediation boundary honored all 9 action types (zero AccessDenied), and the independent gate + executor gate re-check passed every legitimate plan. One gate false-positive (association-swap completeness) was caught by this very regression and fixed. |
+| 2026-07-25 post-tiers + quality pass | nova-micro | 9/9 | 6/9 | **9/9** | ~114s | first run with autonomy tiers live. Per-class MTTR: 182/82/132/132/80/97/72/87/162 s. LOW classes are *slower* than the old approval path by design — they sit out a 60 s veto window before self-healing. Also exercised: the HIGH-tier dual-token path, the tamper-evident anchor (`chain_head` matches an independent `verify_ledger`), and a populated MTTR in the compliance export. 6 RA analyses, ~$0.60. |
 
 Deterministic classification is 9/9 every run — it drives control flow. Remediation went
 5/9 → 9/9 once the two governance bugs below were fixed; it never depended on the LLM.
