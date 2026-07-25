@@ -40,17 +40,37 @@ if ($out.TableName) {
 }
 
 # ---- stacks, platform first (its IAM boundary and probe config reference lab resource ids) ----
+# Retries once: EC2's dependency checks lag behind deletions by a few seconds, so a route table
+# can report "has dependencies" moments after the thing depending on it was removed. Observed
+# live -- the first attempt failed, a direct delete of the same route table succeeded instantly.
 function Remove-Stack($name) {
     $exists = aws cloudformation describe-stacks --stack-name $name --query "Stacks[0].StackName" --output text 2>$null
     if (-not $exists -or $exists -eq "None") { Write-Host "  $name already gone"; return }
-    Write-Host "deleting $name (CloudFront propagation makes this slow, not stuck)..."
-    aws cloudformation delete-stack --stack-name $name
-    aws cloudformation wait stack-delete-complete --stack-name $name
-    if ($LASTEXITCODE -ne 0) {
-        Fail "$name did not reach DELETE_COMPLETE - check: aws cloudformation describe-stack-events --stack-name $name"
-    } else { Write-Host "  $name deleted" -ForegroundColor Green }
+    foreach ($attempt in 1, 2) {
+        if ($attempt -eq 1) {
+            Write-Host "deleting $name (CloudFront propagation makes this slow, not stuck)..."
+        } else {
+            Write-Host "  retrying $name after letting EC2 dependency state settle..."
+            Start-Sleep -Seconds 30
+        }
+        aws cloudformation delete-stack --stack-name $name
+        aws cloudformation wait stack-delete-complete --stack-name $name
+        if ($LASTEXITCODE -eq 0) { Write-Host "  $name deleted" -ForegroundColor Green; return }
+    }
+    Fail "$name did not reach DELETE_COMPLETE - check: aws cloudformation describe-stack-events --stack-name $name"
 }
 Remove-Stack "netops-platform"
+
+# The platform's OWN operation blocks the lab's teardown: every Reachability Analyzer run creates
+# an analysis, and a NetworkInsightsPath cannot be deleted while any analysis exists against it.
+# So the lab stack fails on PathPrivateToPublic / PathPublicToIgw (and then on the route table
+# they transitively pin) until the analyses are cleared. Analyses cost nothing to retain, which is
+# exactly why this went unnoticed -- it is a teardown-completeness bug, not a cost one.
+$analyses = @((aws ec2 describe-network-insights-analyses --query "NetworkInsightsAnalyses[].NetworkInsightsAnalysisId" --output text 2>$null) -split "\s+" | Where-Object { $_ })
+if ($analyses.Count -gt 0) {
+    Write-Host "clearing $($analyses.Count) Reachability Analyzer analyses (they pin the paths)..."
+    foreach ($a in $analyses) { aws ec2 delete-network-insights-analysis --network-insights-analysis-id $a 2>&1 | Out-Null }
+}
 Remove-Stack "netops-lab"
 
 # ---- SAM's own managed artifact stack ----------------------------------------------------------

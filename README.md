@@ -201,6 +201,14 @@ before CloudFormation will delete them (and SAM's artifact bucket is *versioned*
 versions and delete markers have to go too), and the CloudFront distribution takes 15–25 minutes
 to disable and propagate — slow, not stuck.
 
+One ordering constraint is self-inflicted and worth knowing: **the platform's own operation blocks
+the lab's teardown.** Every Reachability Analyzer run creates an analysis, and a
+`NetworkInsightsPath` cannot be deleted while any analysis exists against it — so the lab stack
+fails on its two paths, and then on the route table they transitively pin. Analyses cost nothing
+to retain, which is precisely why this stayed hidden: it is a teardown-completeness bug, not a
+cost one. The script now clears them first, and retries each stack once, because EC2's dependency
+checks lag a few seconds behind deletions.
+
 `verify_teardown.ps1` is the one that matters. It checks every resource class by name, then sweeps
 **ten regions** for the classes that actually cost real money — an orphaned Elastic IP is
 ~$3.60/month and no name-based search would ever find it. It also asserts, as a *positive*, that a
