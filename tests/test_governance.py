@@ -2,8 +2,43 @@
 tamper-evidence anchor. Neither had any test despite mediating all human decisions."""
 import json
 
+import pytest
+
 from functions.governance import handler
 from shared import ddb, ledger, status
+
+# --- envelope validation ----------------------------------------------------------------------
+# Only the state machine can invoke this, so these are defense in depth -- but this is the
+# function that writes task tokens and statuses onto incidents, so an unvalidated incident_id
+# or wait_status is a cross-incident overwrite one bad ASL edit away.
+
+def test_store_token_rejects_a_status_that_is_not_decision_pending(netops_table):
+    """Parking an incident in a status the API's approval guard does not recognise would
+    strand a live task token: the wait never resolves and no operator can act."""
+    ddb.create_incident("gv1", {"status": status.PROVING, "gsi1sk": "2026"})
+    with pytest.raises(ValueError, match="not a decision-pending status"):
+        handler.lambda_handler({"op": "store_token", "incident_id": "gv1", "token": "T",
+                                "wait_status": status.RESOLVED}, None)
+    assert "task_token" not in ddb.get_incident("gv1")
+
+
+def test_store_token_refuses_an_unknown_incident(netops_table):
+    with pytest.raises(ValueError, match="no such incident"):
+        handler.lambda_handler({"op": "store_token", "incident_id": "ghost", "token": "T",
+                                "wait_status": status.AWAITING_APPROVAL}, None)
+
+
+def test_missing_envelope_fields_fail_loudly(netops_table):
+    for event in ({"incident_id": "gv2"}, {"op": "store_token"}):
+        with pytest.raises(ValueError, match="missing"):
+            handler.lambda_handler(event, None)
+
+
+def test_store_token_requires_a_token(netops_table):
+    ddb.create_incident("gv3", {"status": status.PROVING, "gsi1sk": "2026"})
+    with pytest.raises(ValueError, match="without a task token"):
+        handler.lambda_handler({"op": "store_token", "incident_id": "gv3",
+                                "wait_status": status.AWAITING_APPROVAL}, None)
 
 
 def test_store_token_sets_wait_status_and_no_deadline(netops_table):
@@ -65,9 +100,11 @@ def test_anchor_is_honest_about_a_broken_chain(netops_table):
 
 
 def test_unknown_op_raises(netops_table):
-    import pytest
+    # the incident must exist, else the envelope check rejects it first and this would pass
+    # for the wrong reason
+    ddb.create_incident("g6", {"status": status.PROVING, "gsi1sk": "2026"})
     with pytest.raises(ValueError, match="unknown op"):
-        handler.lambda_handler({"op": "nope", "incident_id": "x"}, None)
+        handler.lambda_handler({"op": "nope", "incident_id": "g6"}, None)
 
 
 def test_anchor_on_incident_with_no_ledger(netops_table):

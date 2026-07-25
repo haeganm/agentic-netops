@@ -76,6 +76,10 @@ so multi-fault diffs heal correctly regardless of classification.
   approval, **HIGH** requires **two distinct approvers** (maker-checker). A global kill-switch
   forces everything to a human. The tier never changes *what* the fix does — the gate still
   bounds it to converge-to-baseline — only *who signs off*.
+- **Segregation of duties as recusal** — whoever caused the drift is removed from *every*
+  decision on their own change: approve, reject **and** veto (ADR 0016). Approve-only SoD looks
+  sufficient until the drift *is* the security hole, at which point blocking the repair preserves
+  it, and the ledger records that as a routine decision.
 - **Tamper-evident ledger** — every decision is a link in a per-incident SHA-256 hash chain;
   `verify_ledger` detects any alteration/insertion/deletion at the exact sequence number.
 - **Compliance evidence export** — `GET /incidents/{id}/evidence` produces an auditor-ready
@@ -84,16 +88,22 @@ so multi-fault diffs heal correctly regardless of classification.
 
 ## Engineering evidence
 
-- 134 automated tests, credential-free CI (moto-mocked; `tests/conftest.py` makes real AWS
+- 147 automated tests, credential-free CI (moto-mocked; `tests/conftest.py` makes real AWS
   unreachable), static ASL validation, and a **standing adversarial red-team suite**
   (`tests/test_redteam.py`) that re-checks tier-forcing, plan-tampering, replayed approvals,
   two-party bypass, and ledger-tampering on every run
-- **Adversarially audited** on three fronts (IAM/STS/gate/wallet, injection/auth,
-  infra/supply-chain) plus an attack-surface analysis of the auto-execute path (A1–A7) — see
-  `docs/SECURITY.md`. Highlights: an independent (non-tautological) policy gate, tag-scoped
-  remediation boundary, config-as-trust-boundary IAM, exact-identity detector guard, SoD
-- 15 ADRs including live-verified IAM/platform facts — start with `docs/adr/README.md`;
+- **Adversarially audited three times**: IAM/STS/gate/wallet + injection/auth +
+  infra/supply-chain; an attack-surface analysis of the auto-execute path (A1–A8); and a pass on
+  the identity/authorization perimeter run against the **deployed** stack — see
+  `docs/SECURITY.md`. Highlights: an independent (non-tautological) policy gate, a tag-scoped
+  remediation boundary proven 18/18 by `scripts/verify_boundary.py`, config-as-trust-boundary
+  IAM, an exact-identity detector guard, and segregation of duties as full recusal (ADR 0016)
+- 16 ADRs including live-verified IAM/platform facts — start with `docs/adr/README.md`;
   conventions (error-handling policy, single-sources-of-truth) in `docs/conventions.md`
+- **Findings that only live testing could catch** are recorded rather than quietly fixed: a green
+  9/9 eval once coexisted with *every* console approval returning 500, because the eval harness
+  completes task tokens with admin credentials and never touches the API. `docs/evals.md` now
+  says so in the caveat, and a regression test guards the IAM that caused it
 - **Self-audited a second time**: a bug-hunt / architecture / docs review of this repo found
   ~30 issues — including a policy gate that was tautological, a tamper-evidence claim that
   wasn't implemented, and a "kill-switch" test that re-implemented the rule it verified. All
@@ -152,12 +162,19 @@ Two things worth knowing when driving it by hand:
   cleanup. The wait has to outlast CloudTrail delivery; pass `--no-wait` if you're about to seed
   another fault immediately anyway.
 
-Audit any incident (read-only, no console needed):
+Audit any incident, and the platform's own guard rails (all read-only, no console needed):
 
 ```powershell
 .venv\Scripts\python scripts\verify_ledger.py <incident-id>       # cryptographic chain check
 .venv\Scripts\python scripts\compliance_export.py <incident-id>   # auditor-ready control report
+.venv\Scripts\python scripts\verify_boundary.py                   # prove the IAM blast radius
 ```
+
+`verify_boundary.py` is worth a look for *how* it verifies. The obvious test — assume
+`RemediationRole` and try to touch an untagged resource — is impossible, because the trust policy
+admits only the executor Lambda: the control's own correctness blocks its documented test. So it
+proves the claim in three provable parts instead (per-action policy logic against the real
+deployed boundary, live tag presence, and non-assumability), mutating nothing and costing nothing.
 
 Operational switches:
 

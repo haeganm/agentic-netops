@@ -37,6 +37,17 @@ depends on the LLM — a remediation failure is a platform bug, not a model regr
 | 2026-07-24 post-security-hardening | nova-micro | 9/9 | 6/9 | **9/9** | ~90s | regression after the audit remediation: the tag-scoped remediation boundary honored all 9 action types (zero AccessDenied), and the independent gate + executor gate re-check passed every legitimate plan. One gate false-positive (association-swap completeness) was caught by this very regression and fixed. |
 | 2026-07-25 post-tiers + quality pass | nova-micro | 9/9 | 6/9 | **9/9** | ~114s | first run with autonomy tiers live. Per-class MTTR: 182/82/132/132/80/97/72/87/162 s. LOW classes are *slower* than the old approval path by design — they sit out a 60 s veto window before self-healing. Also exercised: the HIGH-tier dual-token path, the tamper-evident anchor (`chain_head` matches an independent `verify_ledger`), and a populated MTTR in the compliance export. 6 RA analyses, ~$0.60. |
 
+## Guard-rail verification (not model evals — the platform's own controls)
+
+Recorded here because these are measured results, not claims, and because two of them are the
+only evidence for assertions `docs/SECURITY.md` makes.
+
+| Date (UTC) | Check | Result |
+|---|---|---|
+| 2026-07-25 | `scripts/verify_boundary.py` — the tag-scoped IAM blast radius | **18/18 pass.** 12 tag-scoped actions each simulated on *its own* resource type (correct tag allowed; wrong tag / absent tag / wrong region denied), the ARN-pinned `ModifyVpcAttribute` exception (lab VPC allowed, other VPC denied), all 8 lab resources confirmed carrying `Project=agentic-netops`, and the role confirmed **not** assumable by the account admin. Closes the ADR 0010 open item. Read-only, $0. |
+| 2026-07-25 | Live API authorization, through the real HTTP endpoint | veto → `CANCELLED`; MEDIUM approve → `RESOLVED`; HIGH → second-approval state → same-user **403** → distinct approver → `RESOLVED`; drift-causer recused from approve **and** reject (**403** each) while another operator succeeds; causer's veto refused (**403**) and the self-heal proceeds; `verify`/`evidence` endpoints good; kill-switch forces LOW → MEDIUM. |
+| 2026-07-25 | Perimeter probes against the deployed stack | 401 on unauthenticated, malformed-token, `alg=none`, and identity-forging-header requests; CORS refuses a hostile origin; CSP + `Permissions-Policy` served; username enumeration closed (unknown user and wrong password return byte-identical errors). |
+
 Deterministic classification is 9/9 every run — it drives control flow. Remediation went
 5/9 → 9/9 once the two governance bugs below were fixed; it never depended on the LLM.
 

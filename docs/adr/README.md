@@ -22,8 +22,18 @@ to sign off), **0014** (why the record can be trusted).
 | [0014](0014-hash-chained-ledger.md) | Tamper-evident hash-chained decision ledger | Any alteration/insertion/deletion is detectable at an exact sequence number; the head is anchored out-of-band |
 | [0015](0015-compliance-evidence-export.md) | Per-incident compliance evidence export | Six control assertions, each backed by concrete evidence — including the ledger's own integrity |
 
-All are `accepted`. None is superseded, but two were **corrected** after being contradicted by
-the code: 0004 (the gate was a tautology; now genuinely independent) and 0003 (it claimed a
-post-VERIFY re-baseline that was never implemented, and shouldn't be). Both corrections are
-recorded in the ADRs themselves rather than hidden — see `docs/SECURITY.md` for the audit that
-found them.
+| [0016](0016-sod-is-recusal-not-approval-only.md) | Segregation of duties means recusal, not "cannot approve" | The drift-causer is removed from every decision on their own change — approve, reject and veto |
+
+All are `accepted`. None is fully superseded, but three were **corrected** after being
+contradicted by the code or by live evidence:
+
+- **0004** — the policy gate was a tautology (it compared the planner's output to a second call
+  of the same planner); now genuinely independent.
+- **0003** — it claimed a post-VERIFY re-baseline that was never implemented, and shouldn't be
+  (re-baselining after a failed verify would enshrine drift).
+- **0013** — its SoD scope was approve-only, which left the drift-causer able to *block* the
+  repair for their own change; narrowed by **0016** to full recusal.
+
+Corrections are recorded in the ADRs themselves rather than quietly patched. See
+`docs/SECURITY.md` for the three audit passes that found them, including the register of
+regressions that only live testing could catch.

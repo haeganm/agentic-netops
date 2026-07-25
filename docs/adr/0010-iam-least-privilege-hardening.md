@@ -37,5 +37,14 @@ A three-front adversarial audit found the governance claims were partly aspirati
   resources only."
 - The boundary tag-condition must be live-verified per action (support varies); the
   ModifyVpcAttribute ARN-scoping is the documented fallback for the one action that lacks it.
+  **CLOSED 2026-07-25** by `scripts/verify_boundary.py` — 13 actions verified against the
+  deployed boundary, each simulated on *its own* resource type: correct tag allowed; wrong tag,
+  absent tag and wrong region denied; ModifyVpcAttribute allowed on the lab VPC and denied on
+  another. Also asserts the lab resources genuinely carry the tag, and that the role is not
+  assumable by the caller. 18/18 pass, read-only.
+  Note the original verification procedure ("assume RemediationRole and try an untagged
+  resource") was **impossible**: the trust policy admits only `ExecutorFunctionRole`, so no
+  operator can assume the role. The control's own correctness blocked its documented test; see
+  the script's docstring for the decomposition that replaced it.
 - Effective remediation permission is now role ∩ (tag-scoped boundary) ∩ (per-incident
   session policy) — three independent rings, each genuinely constraining.

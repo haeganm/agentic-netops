@@ -104,7 +104,89 @@ mapped to that admin ARN is blocked from approving *every* seeded fault — leav
 approver where two are required. A HIGH-tier incident could never be approved. The fix is
 operational, not code: **two non-admin operators**, documented in the README.
 
+## Third pass: the identity & authorization perimeter
+
+The first three audits all examined what happens *after* a valid JWT arrives. This pass probed
+the perimeter itself against the **deployed** stack.
+
+**Confirmed holding** (live, read-only): unauthenticated, malformed-token, `alg=none`, and
+identity-forging-header requests all 401 at the gateway authorizer; CORS echoes only the
+CloudFront origin and refuses others; both S3 buckets have all four public-access blocks plus
+TLS-only denies; `RemediationRole` is assumable **only** by the executor — not even the account
+admin can assume it; no role carries `AdministratorAccess`; the console has no XSS sink (every
+DOM write is `textContent`); no secrets in the repo, and `ui/config.js` is genuinely ignored.
+
+| Severity | Finding | Fix |
+|---|---|---|
+| HIGH | **SoD guarded approval only** — the drift-causer could reject or veto the repair for their own change. When the drift *is* the security hole, blocking the fix preserves it, and the ledger records it as a routine decision | Recusal from every decision (approve/reject/cancel) | ADR 0016 |
+| MED | **Actor identity failed open** — a token without an `email` claim yielded the actor string `"unknown"`, which flowed into the SoD comparison, `first_approver`, and the ledger as the approver of a live network change | 403 on any POST without an attributable caller; guard is route-prefixed so future POST routes inherit it |
+| MED | **`GET /verify` reported tampering for a nonexistent id** — returned 200 `{valid: false, first_break_seq: 1}`, indistinguishable from a real broken chain, in the one tool whose job is telling those apart | 404 when the incident does not exist |
+| MED | **`governance.store_token` validated nothing** — accepted any `incident_id` and any `wait_status` string, then overwrote `task_token` + `status`. Only IAM stood between a bad ASL edit and a cross-incident token overwrite | Envelope validation: incident must exist, `wait_status` must be in `status.AWAITING_DECISION` |
+| MED | **Username enumeration** — `PreventUserExistenceErrors` unset, so Cognito distinguished unknown-user from wrong-password on an unauthenticated endpoint | `ENABLED`; verified live that both now return identical `NotAuthorizedException` |
+| MED | **No API access logging** — a denied 403 (an SoD recusal, a two-party bypass attempt) left no durable trace beyond a 7-day Lambda log written only if the handler happened to log it | Access log group with the caller's email per request, plus a metric filter and alarm on repeated 403s |
+| LOW | **30-day refresh tokens** on a console that can mutate a live network — and the console discards the refresh token anyway | 24 hours |
+| LOW | **Password policy was length-only** (12 chars, no character classes) | upper + lower + digits required |
+| LOW | **No CSP / Permissions-Policy** on a page that renders LLM-authored text | Both added; see the `unsafe-inline` note below |
+| LOW | **CI had no `permissions:` block** (GITHUB_TOKEN inherited the repo default) and pinned all actions to mutable major tags | `contents: read`, SHA-pinned at the versions already proven green, `timeout-minutes` |
+
+Two of these deserve their honest ceilings stated:
+
+- **The CSP carries `'unsafe-inline'`**, because the console is a single inline `<script>` +
+  `<style>`; that concedes most of CSP's XSS value. What it does buy is `connect-src`: the page
+  holds a JWT that can approve live network changes, and outbound calls are now pinned to API
+  Gateway and Cognito, so injected script cannot exfiltrate that token to an arbitrary origin.
+  `object-src`/`base-uri`/`form-action`/`frame-ancestors` are locked regardless. Upgrade path:
+  extract the script and style to files and drop `unsafe-inline`.
+- **`connect-src` uses a `*.execute-api` host wildcard**, not this stack's API id, because naming
+  the id creates a genuine CloudFormation cycle (CSP → HttpApi → CORS → distribution domain →
+  CSP). Exfiltration would require an attacker-controlled API Gateway in the same region.
+
+### The boundary check is finally runnable — and the documented procedure was impossible
+
+`SECURITY.md` demanded (and ADR 0010 still listed as open) "assume `RemediationRole`, attempt a
+mutation on an untagged resource, expect `AccessDenied`". That procedure **cannot be executed**:
+the trust policy admits only `ExecutorFunctionRole`, so no operator can assume the role. The
+control being correct is what made its own verification impossible.
+
+`scripts/verify_boundary.py` decomposes the claim into three parts that *are* each provable,
+read-only, mutating nothing and costing nothing:
+
+1. **Policy logic** — every mutating action simulated against **its own resource type** (an
+   important detail: `ec2:CreateRoute` on a security-group ARN denies regardless of tags, which
+   would look like the boundary working while testing nothing), with explicit tag context:
+   correct tag ⇒ allowed; wrong tag, absent tag, wrong region ⇒ denied. Plus the ARN-pinned
+   `ModifyVpcAttribute` exception: the lab VPC allowed, another VPC denied.
+2. **Live tagging** — every lab resource the planner can target actually carries
+   `Project=agentic-netops`. A correct policy guarding mistagged resources would still fail.
+3. **Trust** — the role is not assumable by the caller running the check.
+
+**Result: 18/18 pass.** Together with the recorded 9/9 end-to-end remediation runs, this closes
+the open item without weakening anything in order to test it.
+
 ## Accepted risks (deliberate, not oversights)
+
+- **Encryption at rest uses AWS-owned keys, not a CMK.** The ledger, the SNS anchor topic and
+  the CloudTrail bucket are all encrypted, but a customer-managed key is the enterprise
+  expectation for a tamper-evidence store — it would let a key policy separate "may write
+  incidents" from "may rewrite history", which is exactly the separation the hash chain is
+  trying to establish. Not done because each CMK is ~$1/month and this project's hard
+  constraint is a **$0.00 idle bill**. *Close later:* a CMK on the table with a key policy that
+  denies the runtime roles `kms:ReEncrypt*`/`kms:Decrypt` on historical items.
+- **The tag is a trust boundary with no tag governance.** `RemediationRole` may mutate anything
+  tagged `Project=agentic-netops`. `RemediationRole` itself cannot tag (no `ec2:CreateTags`
+  anywhere), but this is a standalone account with **no AWS Organization**, so no SCP can
+  restrict who else may apply that tag — an admin could tag a production resource into scope.
+  *Close later (the production answer):* an SCP denying `ec2:CreateTags` for
+  `aws:RequestTag/Project = agentic-netops` outside a break-glass role.
+- **`USER_PASSWORD_AUTH` is enabled and SRP is not.** The console posts `InitiateAuth` directly
+  from the browser, so passwords reach Cognito rather than being proved by SRP. Cognito
+  rate-limits the endpoint and enumeration is now closed. *Close later:* SRP, or the Cognito
+  hosted UI with an OIDC redirect.
+- **No GuardDuty, AWS Config, or WAF.** All three are metered; their absence is a cost decision
+  rather than an oversight. The origin is private (OAC) and Cognito-gated, and the detector's
+  own CloudTrail consumption covers the change-detection role Config would play here.
+- **Cognito advanced security (threat protection) is off** — no compromised-credential
+  detection or adaptive auth. It moves the pool to a paid tier.
 
 - ~~**No segregation of duties on approval.**~~ **CLOSED (ADR 0013):** HIGH-tier incidents
   require two distinct approvers (maker-checker); an approver mapped (via `CONFIG#APPROVERS`)
@@ -135,10 +217,20 @@ operational, not code: **two non-admin operators**, documented in the README.
 - **CloudTrail is single-region.** Correct by design — the detector consumes only in-region
   EC2 management events.
 
-## Live verification still required after deploy
+## Live verification after deploy — now scripted
 
-The boundary tag-condition (ADR 0010) is the one fix that must be confirmed against real AWS:
-assume `RemediationRole` and attempt a mutation on an **untagged** resource → expect
-`AccessDenied`; a lab-tagged resource → succeeds. `aws:ResourceTag` support varies by action,
-so any AccessDenied on a legitimate lab remediation during the eval regression means that
-action needs the ARN-scoping fallback instead of the tag condition.
+Two things cannot be proven by reading code or running the unit suite. Both are now runnable:
+
+```powershell
+.venv\Scripts\python scripts\verify_boundary.py    # boundary: policy logic + live tags + trust
+```
+
+**And the standing rule that a green eval does not cover:** any change touching the approval path
+(`states:SendTask*` IAM, the API handler's guards, the governance token writer) must be verified
+by a real approve/reject/veto **through the HTTP API**. `scripts/evaluate.py` completes task
+tokens directly with admin credentials, so a 9/9 run has already coexisted with every console
+approval returning 500. See the regression register above and `docs/evals.md`.
+
+Residual per-action caveat: `aws:ResourceTag` support varies by EC2 action, so an `AccessDenied`
+on a *legitimate* lab remediation during an eval regression still means that action needs the
+ARN-scoping fallback rather than the tag condition (as `ModifyVpcAttribute` already does).

@@ -277,16 +277,36 @@ Resources:
       Policies:
         PasswordPolicy:
           MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          # symbols deliberately not required: length + classes + the 12-char floor already
+          # exceed NIST 800-63B, and symbol rules mostly drive password reuse
 
   UserPoolClient:
     Type: AWS::Cognito::UserPoolClient
     Properties:
       UserPoolId: !Ref UserPool
       GenerateSecret: false
+      # USER_PASSWORD_AUTH (not SRP) because the console posts InitiateAuth directly from the
+      # browser; the tradeoff is recorded in SECURITY.md. Cognito rate-limits this endpoint,
+      # and PreventUserExistenceErrors below removes the enumeration oracle.
       ExplicitAuthFlows: [ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      # Without this, Cognito returns UserNotFoundException for an unknown address and
+      # NotAuthorizedException for a bad password -- a username enumeration oracle on an
+      # unauthenticated endpoint. ENABLED makes both responses identical.
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: hours
       AccessTokenValidity: 1
       IdTokenValidity: 1
-      RefreshTokenValidity: 30
+      # was 30 DAYS. A stolen refresh token is a persistent foothold on a console that can
+      # mutate a live network, and the console discards the refresh token entirely (it does a
+      # hard logout at ID-token expiry), so shortening this costs nothing operationally.
+      RefreshTokenValidity: 24
       WriteAttributes: [email]
       ReadAttributes: [email]
 
@@ -300,6 +320,19 @@ Resources:
         AllowOrigins: [!Sub "https://${UiDistribution.DomainName}"]
         AllowHeaders: [Authorization, Content-Type]
         AllowMethods: [GET, POST, OPTIONS]
+      # A DENIED decision (403 from an SoD recusal, a two-party bypass attempt, an
+      # unattributable token) is exactly the signal that someone is probing the approval
+      # controls -- and it left no durable trace, since the ApiFunction log has 7-day retention
+      # and records the attempt only if the handler happened to log it. The access log records
+      # every request with its caller, independently of application code.
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime","routeKey":"$context.routeKey",
+          "status":"$context.status","caller":"$context.authorizer.claims.email",
+          "integrationStatus":"$context.integrationStatus",
+          "responseLatency":"$context.responseLatency"}
       Auth:
         DefaultAuthorizer: CognitoJwt
         Authorizers:
@@ -390,6 +423,40 @@ Resources:
       LogGroupName: !Sub /aws/lambda/${ApiFunction}
       RetentionInDays: 7
 
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}-console
+      RetentionInDays: 7
+
+  # Turns denied decisions into a metric so they can be alarmed on. 403 here is never routine:
+  # it means an SoD recusal, a two-party bypass attempt, or an unattributable token.
+  ApiDeniedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiAccessLogGroup
+      FilterPattern: '{ $.status = "403" }'
+      MetricTransformations:
+        - MetricNamespace: NetOps
+          MetricName: ApiForbidden
+          MetricValue: "1"
+          DefaultValue: 0
+
+  ApiForbiddenAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: repeated 403s on the console API - someone is probing the approval controls
+      Namespace: NetOps
+      MetricName: ApiForbidden
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      # a single 403 is a demo of the control working; a burst is someone testing it
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertTopic]
+      TreatMissingData: notBreaching
+
   # ---- console hosting (CloudFront + private S3, v1 pattern)
   UiBucket:
     Type: AWS::S3::Bucket
@@ -440,6 +507,36 @@ Resources:
           ContentTypeOptions: {Override: true}
           FrameOptions: {FrameOption: DENY, Override: true}
           ReferrerPolicy: {ReferrerPolicy: no-referrer, Override: true}
+          # ponytail: 'unsafe-inline' because index.html is one inline <script> + <style>; the
+          # upgrade path is extracting them to app.js/app.css and dropping it. Even so the
+          # valuable directive here is connect-src: the page holds a JWT that can approve live
+          # network changes, and this pins outbound calls to API Gateway and Cognito, so
+          # injected script cannot exfiltrate that token to an arbitrary origin. object/base/
+          # form/frame are locked regardless.
+          # ponytail: connect-src uses a *.execute-api host wildcard rather than this stack's
+          # API id. Naming the id creates a real CloudFormation cycle (CSP -> HttpApi -> CORS
+          # -> UiDistribution.DomainName -> this policy). Exfiltration would require an
+          # attacker-controlled API Gateway in this same region; tighten by moving CORS off the
+          # distribution domain (a custom domain) if that ever matters.
+          ContentSecurityPolicy:
+            Override: true
+            ContentSecurityPolicy: !Sub >-
+              default-src 'self';
+              script-src 'self' 'unsafe-inline';
+              style-src 'self' 'unsafe-inline';
+              connect-src 'self' https://*.execute-api.${AWS::Region}.amazonaws.com
+              https://cognito-idp.${AWS::Region}.amazonaws.com;
+              img-src 'self' data:;
+              object-src 'none';
+              base-uri 'none';
+              form-action 'none';
+              frame-ancestors 'none'
+        CustomHeadersConfig:
+          Items:
+            # not expressible via SecurityHeadersConfig; the console needs none of these
+            - Header: Permissions-Policy
+              Value: "camera=(), microphone=(), geolocation=(), payment=(), usb=()"
+              Override: true
 
   UiOriginAccessControl:
     Type: AWS::CloudFront::OriginAccessControl
@@ -824,6 +921,9 @@ Outputs:
     Value: !Ref ProbeFunction
   StateMachineArn:
     Value: !Ref IncidentStateMachine
+  RemediationRoleArn:
+    # exported so scripts/verify_boundary.py (and an auditor) can probe the boundary directly
+    Value: !GetAtt RemediationRole.Arn
   ApiUrl:
     Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
   UserPoolId:

@@ -23,11 +23,27 @@ from shared.log import log
 
 
 def lambda_handler(event, context):
+    # Validate the envelope. Only the state machine can invoke this (it alone holds the
+    # LambdaInvokePolicy), so this is defense in depth rather than a trust boundary -- but this
+    # is the function that writes task tokens and statuses onto incidents, so an unvalidated
+    # incident_id or wait_status here is a cross-incident token/status overwrite waiting for a
+    # bad ASL edit. Fail loudly on the plumbing rather than corrupting an incident.
+    for required in ("op", "incident_id"):
+        if not event.get(required):
+            raise ValueError(f"governance: missing {required}")
     op = event["op"]
     iid = event["incident_id"]
+    if not ddb.get_incident(iid):
+        raise ValueError(f"governance: no such incident {iid}")
 
     if op == "store_token":
+        if not event.get("token"):
+            raise ValueError("governance: store_token without a task token")
         wait_status = event.get("wait_status", st.AWAITING_APPROVAL)
+        if wait_status not in st.AWAITING_DECISION:
+            # anything else would park the incident in a status the API's approval guard does
+            # not recognise, stranding a live token
+            raise ValueError(f"governance: {wait_status} is not a decision-pending status")
         fields = {"task_token": event["token"], "status": wait_status}
         if event.get("deadline_seconds"):
             # Anchor the countdown to the STATE's entry time, not this Lambda's clock: the SFN
@@ -43,7 +59,7 @@ def lambda_handler(event, context):
 
     if op == "anchor_ledger":
         chain = ledger.verify_ledger(iid)
-        meta = ddb.get_incident(iid) or {}
+        meta = ddb.get_incident(iid) or {}   # re-read: verify_ledger is the slow part above
         mttr = evidence.mttr_seconds(meta)
         fields = {"chain_head": chain.get("head") or "", "chain_len": chain.get("length", 0)}
         if mttr is not None:
