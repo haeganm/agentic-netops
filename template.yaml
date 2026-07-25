@@ -373,14 +373,16 @@ Resources:
       Policies:
         - !Ref NetopsTableAccess
         - Statement:
-            # SendTask* act on a callback TOKEN, not on a state-machine resource: AWS requires
-            # Resource "*" and supports narrowing via the states:StateMachineArn condition key.
+            # SendTask* act on a callback TOKEN, not on a state-machine resource, so they take
+            # Resource "*" and support NO resource-level or condition-key narrowing. Verified
+            # the hard way: an earlier attempt to narrow this with a
+            # `states:StateMachineArn` condition silently denied every approve/reject/cancel
+            # (the key simply doesn't apply to these actions). The security boundary here is
+            # the task token itself -- it is unguessable, single-use, and only ever issued by
+            # this state machine -- not the resource ARN.
             - Effect: Allow
               Action: [states:SendTaskSuccess, states:SendTaskFailure]
               Resource: "*"
-              Condition:
-                StringEquals:
-                  states:StateMachineArn: !Ref IncidentStateMachine
 
   ApiLogGroup:
     Type: AWS::Logs::LogGroup

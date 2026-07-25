@@ -69,6 +69,41 @@ The standing `tests/test_redteam.py` suite re-checks A1/A3-family blocks plus pl
 replayed approvals, two-party bypass, kill-switch enforcement, and ledger tampering on every CI
 run — nine attacks, each asserting the block, not the happy path.
 
+## Regressions found by live testing, and why the test suite missed them
+
+Recorded because the *gap* matters more than the bugs. Both were caught by driving the real
+HTTP API against the deployed stack — neither could have been caught by the unit suite or the
+9-class eval.
+
+**1. Narrowing `states:SendTask*` silently denied every approval.** An audit flagged the
+original `Resource: !Ref IncidentStateMachine` on `SendTaskSuccess`/`SendTaskFailure` as a
+critical deny. That was a false positive — it demonstrably worked. But "hardening" it to
+`Resource: "*"` plus a `states:StateMachineArn` condition *did* break it: that condition key
+does not apply to these actions, so IAM denied implicitly and **every approve, reject and veto
+returned 500**. These actions are authorized by the callback **token**, not by a resource ARN —
+the token is unguessable, single-use, and only ever minted by this state machine, and that is
+the security boundary. `tests/test_iam_parity.py::test_sendtask_grant_is_not_narrowed_into_a_silent_deny`
+now fails if anyone narrows them again.
+
+*Why nothing caught it:* the eval harness completes task tokens **directly with admin
+credentials**, so it never exercises the API's approval path. That caveat was already written
+down in `docs/evals.md` — and it turned out to be load-bearing. Unit tests didn't catch it
+either, because they stub the Step Functions client and so never evaluate IAM. **Any change to
+the `SendTask*` grant must be verified by an approval through the API.**
+
+**2. `chaos.py --restore` raised incidents for its own cleanup.** The restore path mutates with
+the *caller's* identity, not the RemediationRole the detector deliberately ignores, so the
+platform correctly saw the cleanup as drift — and PROVE could snapshot mid-restore and find
+partial drift, producing a real incident for a half-restored lab. Now wrapped in maintenance
+mode with a CloudTrail-flush wait (the same trick `deploy_lab.ps1` uses, ADR 0002). Note the
+wait is required: suppression has to outlast CloudTrail *delivery*, not just the last API call.
+
+**3. Two-party approval was unreachable as documented.** Segregation of duties blocks an
+approver mapped to the drift-causer. Because `chaos.py` runs as the account admin, the operator
+mapped to that admin ARN is blocked from approving *every* seeded fault — leaving one eligible
+approver where two are required. A HIGH-tier incident could never be approved. The fix is
+operational, not code: **two non-admin operators**, documented in the README.
+
 ## Accepted risks (deliberate, not oversights)
 
 - ~~**No segregation of duties on approval.**~~ **CLOSED (ADR 0013):** HIGH-tier incidents

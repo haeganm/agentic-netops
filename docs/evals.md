@@ -3,12 +3,20 @@
 The eval suite (`scripts/evaluate.py`) seeds all 9 labeled fault classes through the REAL
 pipeline — chaos seed → CloudTrail → detect → the full loop — and scores each.
 
-**Scope caveat, stated plainly:** the harness is tier-aware (LOW classes auto-execute through
-the veto window; HIGH classes need two token completions) and it completes Step Functions task
-tokens **directly**, not through the console API. So it validates *the loop*, not the API's
-authorization controls — plan-integrity re-hashing, segregation of duties, and two-party
-distinctness are covered by `tests/test_api.py` and `tests/test_redteam.py` instead, and were
-additionally verified live (403 on a same-user second approval).
+**Scope caveat, stated plainly — and this gap has bitten once:** the harness is tier-aware (LOW
+classes auto-execute through the veto window; HIGH classes need two token completions) but it
+completes Step Functions task tokens **directly with admin credentials**, not through the console
+API. So it validates *the loop*, not the API's authorization path.
+
+That is not a theoretical limitation. A 9/9 green run has coexisted with **every approval in the
+console returning 500** (an IAM narrowing on `states:SendTask*` that denied implicitly — see
+`docs/SECURITY.md`). Unit tests couldn't catch it either, since they stub the Step Functions
+client and never evaluate IAM.
+
+So: a green eval means the remediation loop works. It does **not** mean a human can approve
+anything. Plan-integrity re-hashing, segregation of duties, and two-party distinctness are
+covered by `tests/test_api.py` / `tests/test_redteam.py`, and any change touching the approval
+path must additionally be verified by a real approval through the API.
 
 Scores:
 

@@ -17,6 +17,9 @@ from shared import baseline as base_mod
 from shared import plan as plan_mod
 
 LAB_STACK = os.environ.get("LAB_STACK", "netops-lab")
+# ponytail: fixed wait for CloudTrail delivery. Crude but correct; the alternative
+# (tailing the trail until quiet) is far more machinery for a cleanup path.
+FLUSH_WAIT_S = 150
 
 
 def outputs() -> dict:
@@ -68,8 +71,17 @@ FAULTS = ["sg-ingress-removed", "sg-open-world", "sg-egress-removed", "route-del
           "sg-swapped-on-eni", "dns-disabled"]
 
 
-def restore() -> None:
-    """Direct converge-to-baseline with caller creds (cleanup path, bypasses the loop)."""
+def restore(wait_for_flush: bool = True) -> None:
+    """Direct converge-to-baseline with caller creds (cleanup path, bypasses the loop).
+
+    Suppresses detection while it works: these mutations are made with the CALLER's identity,
+    not the RemediationRole, so the detector would otherwise raise an incident for our own
+    cleanup -- and PROVE can snapshot mid-restore and see partial drift. Same maintenance-mode
+    trick deploy_lab.ps1 uses for CloudFormation's own changes (ADR 0002).
+
+    NOTE the flush wait: CloudTrail delivery lags ~1-2 min, so maintenance mode must stay on
+    past the last event's arrival, not just past the last API call. Pass wait_for_flush=False
+    if you are going to seed another fault immediately anyway."""
     table = _table()
     cfg = table.get_item(Key={"pk": "CONFIG", "sk": "BASELINE"})["Item"]
     base = json.loads(cfg["snapshot"])
@@ -78,6 +90,7 @@ def restore() -> None:
     if not diff:
         print("already at baseline")
         return
+    table.put_item(Item={"pk": "CONFIG", "sk": "MODE", "mode": "maintenance"})
     ec2 = boto3.client("ec2")
     for op in plan_mod.build(diff, base):
         params = dict(op["params"])
@@ -87,6 +100,11 @@ def restore() -> None:
         print(f"applied {op['action']} on {op['resource_id']}")
     remaining = base_mod.diff(base, base_mod.snapshot(inventory))
     print(f"restore complete, residual diff: {len(remaining)}")
+    if wait_for_flush:
+        print(f"  holding detection off {FLUSH_WAIT_S}s while CloudTrail flushes our own changes...")
+        time.sleep(FLUSH_WAIT_S)
+    table.put_item(Item={"pk": "CONFIG", "sk": "MODE", "mode": "normal"})
+    print("  detection re-enabled")
 
 
 def _assoc_for_subnet(ec2, subnet_id: str) -> str:
@@ -111,11 +129,13 @@ if __name__ == "__main__":
     ap.add_argument("fault", nargs="?")
     ap.add_argument("--list", action="store_true")
     ap.add_argument("--restore", action="store_true")
+    ap.add_argument("--no-wait", action="store_true",
+                    help="skip the CloudTrail flush wait (you are about to seed again)")
     args = ap.parse_args()
     if args.list:
         print("\n".join(FAULTS))
     elif args.restore:
-        restore()
+        restore(wait_for_flush=not args.no_wait)
     elif args.fault:
         seed(args.fault, outputs())
         print(f"seeded {args.fault} at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}")

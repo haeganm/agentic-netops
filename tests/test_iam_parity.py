@@ -91,6 +91,24 @@ def test_api_function_iam_is_read_plus_callbacks_only():
     }
 
 
+def test_sendtask_grant_is_not_narrowed_into_a_silent_deny():
+    """REGRESSION: states:SendTaskSuccess/Failure act on a callback token, not a resource.
+    They support neither resource-level permissions nor the states:StateMachineArn condition
+    key -- narrowing them either way produces an implicit deny that breaks EVERY approval,
+    reject and veto with a 500. This was shipped once; the eval harness didn't catch it because
+    it completes task tokens directly instead of through the API."""
+    for res in _template()["Resources"].values():
+        for pol in (res.get("Properties", {}).get("Policies") or []):
+            for stmt in (pol.get("Statement", []) if isinstance(pol, dict) else []):
+                actions = stmt.get("Action", [])
+                actions = [actions] if isinstance(actions, str) else actions
+                if any(a.startswith("states:SendTask") for a in actions):
+                    assert stmt.get("Resource") == "*", \
+                        f"SendTask* must be Resource '*', got {stmt.get('Resource')!r}"
+                    assert "Condition" not in stmt, \
+                        "SendTask* supports no condition keys; any Condition here denies silently"
+
+
 def test_fault_classes_and_oracle_policy_agree():
     """A fault class with no oracle policy silently falls back to the config-drift default."""
     from shared import classify

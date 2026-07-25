@@ -118,12 +118,15 @@ python -m venv .venv; .venv\Scripts\python -m pip install -r requirements-dev.tx
 .\scripts\deploy_platform.ps1                      # platform stack
 .\scripts\deploy_ui.ps1                            # console (prints its URL)
 
-# operators. TWO are needed to exercise HIGH-tier two-party approval.
-.\scripts\create_user.ps1 -Email you@x.com     -Password <12+ chars>
-.\scripts\create_user.ps1 -Email second@x.com  -Password <12+ chars>
+# Operators. You need TWO NON-ADMIN operators to exercise HIGH-tier two-party approval.
+# Why non-admin: segregation of duties blocks whoever CAUSED the drift from approving the fix,
+# and chaos.py runs as your admin identity -- so an operator mapped to that admin ARN is
+# blocked from approving every seeded fault, leaving too few eligible approvers for two-party.
+.\scripts\create_user.ps1 -Email opsA@x.com -Password <12+ chars>
+.\scripts\create_user.ps1 -Email opsB@x.com -Password <12+ chars>
 
-# map each operator to the IAM principal they act as, so an approver who CAUSED the drift
-# is blocked (segregation of duties -- inert until this map is populated).
+# Optionally map YOUR admin identity to an operator account, purely to see the SoD block fire:
+# that account will then be refused on anything you break yourself (403), which is the point.
 .venv\Scripts\python scripts\seed_baseline.py --approver you@x.com=arn:aws:iam::<acct>:user/you
 ```
 
@@ -133,9 +136,21 @@ Drive it:
 .\scripts\demo.ps1 -Fault sg-ingress-removed   # LOW: watch the veto countdown, do nothing -> self-heals
 .\scripts\demo.ps1 -Fault nacl-deny-inserted   # MEDIUM: approve once in the console
 .\scripts\demo.ps1 -Fault sg-open-world        # HIGH: needs BOTH operators
-.venv\Scripts\python scripts\chaos.py --restore     # put the lab back
+.venv\Scripts\python scripts\chaos.py --restore     # put the lab back (see note below)
 .venv\Scripts\python scripts\evaluate.py            # full 9-class eval (~$1 of RA)
 ```
+
+Two things worth knowing when driving it by hand:
+
+- **Restore between faults.** The tier is computed from the *whole current* diff, not just the
+  newest break — so accumulated drift across several resources trips the broad-blast-radius rule
+  and escalates everything to HIGH. That's correct behaviour, but it will surprise you.
+  A *successful* remediation already converges the lab, so `--restore` is only needed after a
+  veto or a failure.
+- **`--restore` pauses detection for ~150 s.** It mutates as *you*, not as the RemediationRole
+  the detector ignores, so without suppression the platform raises an incident for your own
+  cleanup. The wait has to outlast CloudTrail delivery; pass `--no-wait` if you're about to seed
+  another fault immediately anyway.
 
 Audit any incident (read-only, no console needed):
 
