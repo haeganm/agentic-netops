@@ -51,7 +51,9 @@ def append(incident_id: str, stage: str, kind: str, actor: str, payload: dict) -
     # ponytail: single-item optimistic lock, 8 immediate retries. Fine at lab volume;
     # switch to per-incident write sharding only if append throughput ever bottlenecks.
     for _ in range(8):
-        head = t.get_item(Key=_head_key(incident_id)).get("Item")
+        # ConsistentRead: a stale head read guarantees a CAS failure (the write conditions are
+        # always strongly consistent), burning retries against a replica, not real contention.
+        head = t.get_item(Key=_head_key(incident_id), ConsistentRead=True).get("Item")
         prev_seq = int(head["seq"]) if head else 0
         prev_head = head["head_hash"] if head else GENESIS
         seq = prev_seq + 1
@@ -91,8 +93,12 @@ def append(incident_id: str, stage: str, kind: str, actor: str, payload: dict) -
 def verify_ledger(incident_id: str) -> dict:
     """Replay genesis -> head. Returns {valid, length, head, first_break_seq}. Any alteration,
     insertion, or deletion of an entry breaks a downstream hash -> valid=False at that seq."""
-    entries = sorted(query_by_prefix(f"INCIDENT#{incident_id}", "LEDGER#"), key=lambda e: int(e["seq"]))
-    head = table().get_item(Key=_head_key(incident_id)).get("Item")
+    # ConsistentRead on BOTH reads: governance anchors this result out-of-band immediately
+    # after the last append -- an eventually-consistent read here can miss the tail entry,
+    # report a false break, and permanently anchor the wrong head.
+    entries = sorted(query_by_prefix(f"INCIDENT#{incident_id}", "LEDGER#", ConsistentRead=True),
+                     key=lambda e: int(e["seq"]))
+    head = table().get_item(Key=_head_key(incident_id), ConsistentRead=True).get("Item")
 
     running = GENESIS
     for i, e in enumerate(entries, start=1):

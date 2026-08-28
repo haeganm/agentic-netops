@@ -798,6 +798,10 @@ Resources:
     Properties:
       CodeUri: src/
       Handler: functions.executor.handler.lambda_handler
+      # Worst case is a full snapshot + gate re-check + MAX_OPS mutations each with a ledger
+      # write; the global 60s can time out MID-LOOP, which kills the process with no except
+      # block -- a partial apply with no ledger record of where it stopped.
+      Timeout: 180
       Environment:
         Variables:
           REMEDIATION_ROLE_ARN: !GetAtt RemediationRole.Arn

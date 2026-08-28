@@ -13,5 +13,10 @@ if ($LASTEXITCODE -ne 0) { exit 1 }
 
 & $py scripts\seed_baseline.py
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "baseline NOT captured (deploy platform stack first, then rerun: python scripts\seed_baseline.py)"
+    # this run is also what flips CONFIG#MODE back to normal -- if it failed after the
+    # maintenance flag was set, the detector is still SUPPRESSED and will ignore all drift
+    Write-Host "baseline NOT captured - and if maintenance mode was set above, DETECTION IS" -ForegroundColor Red
+    Write-Host "STILL PAUSED until this succeeds. Deploy the platform stack, then rerun:" -ForegroundColor Red
+    Write-Host "  $py scripts\seed_baseline.py" -ForegroundColor Red
+    exit 1
 }

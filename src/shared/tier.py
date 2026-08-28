@@ -7,13 +7,18 @@ misclassification can only ever OVER-escalate (ask for more human oversight), ne
 The tier does not change what the fix does -- the gate still bounds every op to converge to
 baseline -- it only changes who signs off.
 """
+import json
+
 from shared.policy import WORLD_OPEN  # single source: the gate and the tier must agree
 
 LOW, MEDIUM, HIGH = "LOW", "MEDIUM", "HIGH"
 _REMOVING = ("revoke_", "delete_")
 _POSTURE = ("replace_", "modify_network_interface_attribute")
 _ADDITIVE = ("authorize_", "create_route", "create_network_acl_entry", "modify_vpc_attribute")
-_BAD_VERDICTS = ("skipped-budget", "failed", "error")
+# "missing" is synthesized by the planner for an expected-but-never-ledgered oracle (a crashed
+# oracle writes nothing, which must escalate, not read as clean); "inconclusive-timeout" is an
+# RA analysis still running at the poll ceiling -- same epistemic state as a budget skip.
+_BAD_VERDICTS = ("skipped-budget", "inconclusive-timeout", "failed", "error", "missing")
 
 
 def decide(fault_class: str, ops: list[dict], diff: list[dict], oracle_verdicts: list[dict]) -> tuple:
@@ -69,7 +74,6 @@ def _medium_reasons(ops) -> list[str]:
 
 
 def _ingress_world_open(ops, diff) -> bool:
-    import json
     blobs = [json.dumps(op.get("params", {}), default=str)
              for op in ops if "security_group_ingress" in op.get("action", "")]
     blobs += [str(e.get("expected")) + str(e.get("actual"))

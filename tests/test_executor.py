@@ -84,6 +84,59 @@ def test_happy_path_applies_and_verifies(lab):
     assert any(p["FromPort"] == 443 for p in sgs[0]["IpPermissions"])
 
 
+def test_mid_loop_failure_is_ledgered_with_applied_so_far(lab, monkeypatch):
+    """_resolve raising mid-loop used to escape the try entirely: op 1 applied, then silence.
+    The audit trail must always record where the loop stopped and what had been applied."""
+    rule2 = json.dumps({"cidr": "10.42.0.0/24", "from": 8443, "proto": "tcp", "to": 8443}, sort_keys=True)
+    cfg = ddb.get_config("BASELINE")
+    snap = json.loads(cfg["snapshot"])
+    snap["sgs"][lab]["ingress"].append(rule2)
+    ddb.put_config("BASELINE", {"snapshot": json.dumps(snap), "inventory": cfg["inventory"]})
+    op2 = {"action": "authorize_security_group_ingress", "resource_id": lab,
+           "params": {"GroupId": lab, "IpPermissions": [
+               {"IpProtocol": "tcp", "FromPort": 8443, "ToPort": 8443,
+                "IpRanges": [{"CidrIp": "10.42.0.0/24"}]}]}}
+    ops = [_authorize_op(lab), op2]
+    ddb.create_incident("i5", {"status": "EXECUTING", "plan_hash": plan.plan_hash(ops), "gsi1sk": "x"})
+
+    calls = {"n": 0}
+    real = handler._resolve
+    def flaky(ec2, op):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("association lookup exploded")
+        return real(ec2, op)
+    monkeypatch.setattr(handler, "_resolve", flaky)
+
+    with pytest.raises(RuntimeError):
+        handler.lambda_handler({"incident_id": "i5", "ops": ops}, None)
+    last = json.loads(ddb.query_ledger("i5")[-1]["payload"])
+    assert last["result"] == "error"
+    assert last["applied_so_far"] == ["authorize_security_group_ingress"]
+
+
+def test_applied_op_is_never_ledgered_as_error(lab, monkeypatch):
+    """If the ledger write for a SUCCESSFUL op fails, the op must not be re-recorded as an
+    error: that is a self-contradictory audit record (the mutation is live, the chain says
+    'error'). The failure must propagate without a false entry."""
+    from shared import ledger as ledger_mod
+    ops = [_authorize_op(lab)]
+    ddb.create_incident("i6", {"status": "EXECUTING", "plan_hash": plan.plan_hash(ops), "gsi1sk": "x"})
+
+    payloads = []
+    real_append = ledger_mod.append
+    def failing_append(iid, stage, kind, actor, payload):
+        payloads.append(payload)
+        if payload.get("result") == "ok":
+            raise RuntimeError("ddb throttled")
+        return real_append(iid, stage, kind, actor, payload)
+    monkeypatch.setattr(handler.ledger, "append", failing_append)
+
+    with pytest.raises(RuntimeError, match="ddb throttled"):
+        handler.lambda_handler({"incident_id": "i6", "ops": ops}, None)
+    assert not any(p.get("result") == "error" for p in payloads), payloads
+
+
 def test_resolve_fails_fast_when_no_association(lab):
     ec2 = boto3.client("ec2")
     with pytest.raises(ValueError, match="no association"):

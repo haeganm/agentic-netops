@@ -78,6 +78,16 @@ def lambda_handler(event, context):
                            "analysis_id": event["id"], "polls": polls})
             ddb.update_incident(iid, verification="LIMITED")
             log("ra_inconclusive", incident_id=iid, polls=polls)
+        elif done and a["Status"] != "succeeded":
+            # A FAILED analysis errored on the AWS side -- it proved nothing about the network,
+            # and NetworkPathFound is absent, so reading it as reachable=false would fail a
+            # correctly-remediated incident and ledger a false negative as evidence.
+            result["started"] = False
+            ledger.append(iid, stage, "oracle_verdict", "oracle:impact",
+                          {"verdict": a["Status"], "path": event.get("path_key"),
+                           "analysis_id": event["id"]})
+            ddb.update_incident(iid, verification="LIMITED")
+            log("ra_analysis_failed", incident_id=iid, status=a["Status"])
         elif done:
             result["reachable"] = bool(a.get("NetworkPathFound", False))
             ledger.append(iid, stage, "oracle_verdict", "oracle:impact",

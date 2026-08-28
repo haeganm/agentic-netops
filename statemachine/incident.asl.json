@@ -456,12 +456,16 @@
     },
     "VerificationScope?": {
       "Type": "Choice",
-      "Comment": "The repair is proven converged either way; this records HOW COMPLETELY it was verified. If an applicable Reachability Analyzer check was skipped (budget cap, ADR 0005) or timed out inconclusive, the incident closes VERIFICATION_LIMITED rather than claiming full verification.",
+      "Comment": "The repair is proven converged either way; this records HOW COMPLETELY it was verified. If an applicable Reachability Analyzer check was skipped (budget cap, ADR 0005), timed out inconclusive, or its task FAILED outright (the Catch leaves an {Error,Cause} object where 'started' would be -- the last two rules), the incident closes VERIFICATION_LIMITED rather than claiming full verification.",
       "Choices": [
         {"And": [{"Variable": "$.rera.started", "IsPresent": true},
                  {"Variable": "$.rera.started", "BooleanEquals": false}], "Next": "CloseLimited"},
         {"And": [{"Variable": "$.ra.started", "IsPresent": true},
-                 {"Variable": "$.ra.started", "BooleanEquals": false}], "Next": "CloseLimited"}
+                 {"Variable": "$.ra.started", "BooleanEquals": false}], "Next": "CloseLimited"},
+        {"And": [{"Variable": "$.rera", "IsPresent": true},
+                 {"Variable": "$.rera.started", "IsPresent": false}], "Next": "CloseLimited"},
+        {"And": [{"Variable": "$.ra", "IsPresent": true},
+                 {"Variable": "$.ra.started", "IsPresent": false}], "Next": "CloseLimited"}
       ],
       "Default": "Close"
     },

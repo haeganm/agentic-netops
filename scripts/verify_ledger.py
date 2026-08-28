@@ -1,7 +1,8 @@
 """Cryptographically verify an incident's decision ledger. Read-only.
 
   python scripts/verify_ledger.py <incident_id>
-Exit 0 = chain intact; exit 1 = tampering detected (with the first broken seq).
+Exit 0 = chain intact; exit 1 = tampering detected (with the first broken seq);
+exit 2 = no such incident (a typo'd id must never read as a tampering report).
 """
 import os
 import sys
@@ -25,6 +26,9 @@ if __name__ == "__main__":
         raise SystemExit("usage: verify_ledger.py <incident_id>")
     _use_deployed_table()
     r = ledger.verify_ledger(sys.argv[1])
+    if r["length"] == 0:
+        print(f"NOT FOUND — no ledger entries for incident {sys.argv[1]!r}")
+        sys.exit(2)
     if r["valid"]:
         print(f"VALID — {r['length']} entries, head {r['head'][:16]}...")
         sys.exit(0)

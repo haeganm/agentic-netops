@@ -50,6 +50,19 @@ def test_ra_poll_exhaustion_is_inconclusive_not_unreachable(lab, monkeypatch):
     assert ddb.get_incident("o1")["verification"] == "LIMITED"
 
 
+def test_ra_poll_failed_analysis_is_inconclusive_not_unreachable(lab, monkeypatch):
+    """An analysis whose Status is 'failed' errored on the AWS side -- it proved NOTHING about
+    the network. NetworkPathFound is absent on a failed analysis, so reporting reachable=false
+    here fails a correctly-remediated incident and ledgers a false negative as evidence."""
+    out = _ra_poll(monkeypatch, "failed", polls=0)
+    assert out["done"] is True
+    assert out["started"] is False       # routes ReRaHealthy? to LIMITED, not MarkFailed
+    assert "reachable" not in out
+    verdict = json.loads(ddb.query_ledger("o1")[-1]["payload"])
+    assert verdict["verdict"] == "failed" and "reachable" not in verdict
+    assert ddb.get_incident("o1")["verification"] == "LIMITED"
+
+
 def test_ra_poll_keeps_polling_below_the_ceiling(lab, monkeypatch):
     out = _ra_poll(monkeypatch, "running", polls=1)
     assert out["done"] is False and "reachable" not in out

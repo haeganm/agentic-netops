@@ -91,10 +91,15 @@ def test_G_low_weaponization_fails_gate(netops_table):
     assert policy.evaluate(evil, diff, BASE, INV)["verdict"] == "FAIL"
 
 
-def _seed_low_tier_incident(iid="k1"):
-    """A dns-disabled drift: single resource, one additive op, clean oracles -> LOW."""
+def _seed_low_tier_incident(iid="k1", seed_probe=True):
+    """A dns-disabled drift: single resource, one additive op, clean oracles -> LOW.
+    dns-disabled expects a data-plane probe verdict (ORACLE_POLICY), so a healthy run has one
+    in the ledger by planner time -- seed it, or the missing-evidence rule escalates."""
     ddb.put_config("BASELINE", {"snapshot": json.dumps(BASE), "inventory": json.dumps(INV)})
     ddb.create_incident(iid, {"status": "PROVING", "gsi1sk": "2026"})
+    if seed_probe:
+        ledger.append(iid, "MEASURE", "oracle_verdict", "oracle:dataplane",
+                      {"dns": "pass", "tcp": "pass", "latency_ms": 8})
     diff = [{"kind": "changed", "section": "vpc", "resource_id": "vpc-1",
              "field": "dns_support", "expected": True, "actual": False}]
     return {"incident_id": iid, "diff": diff, "diagnosis": {}}
@@ -114,6 +119,18 @@ def test_H_kill_switch_forces_human(netops_table):
     assert out["tier"] == tier.MEDIUM
     reasons = ddb.get_incident("k2")["tier_reasons"]
     assert any("kill-switch" in r for r in reasons), reasons
+
+
+def test_J_crashed_oracle_cannot_pass_as_clean(netops_table):
+    """ATTACK: suppress an oracle (throttle its API, revoke its IAM) so it CRASHES instead of
+    returning a bad verdict. The ASL catches the failure and flows on; nothing is ledgered, and
+    'no verdicts' used to read as 'oracles clean' -> LOW auto-exec with no human. The planner
+    must treat expected-but-absent oracle evidence as an escalation."""
+    event = _seed_low_tier_incident("k4", seed_probe=False)  # probe expected, never ledgered
+    out = planner.lambda_handler(event, None)
+    assert out["tier"] == tier.HIGH
+    reasons = ddb.get_incident("k4")["tier_reasons"]
+    assert any("oracle" in r for r in reasons), reasons
 
 
 def test_I_planner_survives_a_truncated_ledger_payload(netops_table):

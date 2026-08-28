@@ -23,9 +23,18 @@ def lambda_handler(event, context):
     # Skip truncated entries: ledger.append clamps payloads at MAX_PAYLOAD, and a sliced
     # JSON string would raise here -- which used to fail the planner on exactly the widest
     # (highest-severity) drift. A truncated verdict is dropped, never half-parsed.
-    verdicts = [json.loads(e["payload"]) for e in ddb.query_ledger(iid)
-                if e["kind"] == "oracle_verdict" and not e.get("truncated")]
+    entries = [e for e in ddb.query_ledger(iid) if e["kind"] == "oracle_verdict"]
+    verdicts = [json.loads(e["payload"]) for e in entries if not e.get("truncated")]
     fault_class = classify.classify(diff) if diff else "config-drift"
+    # Fail-closed on ABSENT evidence: a crashed oracle ledgers nothing (its ASL failure is
+    # caught and the loop flows on), which used to be indistinguishable from a clean run.
+    # If this class's ORACLE_POLICY expects a verdict that never arrived, synthesize a
+    # "missing" verdict so the tier escalates instead of reading silence as clean.
+    expected = classify.oracles_for(fault_class)
+    actors = {e["actor"] for e in entries}
+    for want, actor in ((expected["ra_path"], "oracle:impact"), (expected["probe"], "oracle:dataplane")):
+        if want and actor not in actors:
+            verdicts.append({"verdict": "missing", "oracle": actor})
     autonomy_tier, tier_reasons = tier.decide(fault_class, ops, diff, verdicts)
     # global kill-switch: force any LOW auto-exec back to a human (admin-only CONFIG#AUTONOMY)
     if (ddb.get_config("AUTONOMY") or {}).get("mode") == "manual" and autonomy_tier == tier.LOW:

@@ -11,6 +11,12 @@ Write-Host "current model: $prev ; deploying candidate $ModelId to eval against 
 
 sam build; if ($LASTEXITCODE -ne 0) { exit 1 }
 sam deploy --parameter-overrides "ModelId=$ModelId" | Out-Null  # other params retain previous values
+if ($LASTEXITCODE -ne 0) {
+    # an unchecked failure here would eval the INCUMBENT model and record a PASS for a
+    # candidate that was never live
+    Write-Host "candidate deploy failed - nothing evaluated, nothing released" -ForegroundColor Red
+    exit 1
+}
 
 $env:MODEL_ID = $ModelId
 $out = & $py scripts\evaluate.py 2>&1 | Tee-Object -Variable evalOut
@@ -24,4 +30,7 @@ if ($result -match "diagnosed=(\d+)/(\d+) remediated=(\d+)/(\d+)") {
 }
 Write-Host "GATE FAIL - rolling back to $prev" -ForegroundColor Red
 sam deploy --parameter-overrides "ModelId=$prev" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "ROLLBACK FAILED - the failing candidate $ModelId is still deployed" -ForegroundColor Red
+}
 exit 1

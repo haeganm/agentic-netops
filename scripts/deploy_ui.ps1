@@ -2,7 +2,14 @@
 $ErrorActionPreference = "Continue"
 $out = @{}
 $raw = aws cloudformation describe-stacks --stack-name netops-platform --query "Stacks[0].Outputs" | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or -not $raw) {
+    Write-Host "cannot read netops-platform outputs - refusing to publish a config.js with empty apiUrl/clientId" -ForegroundColor Red
+    exit 1
+}
 foreach ($o in $raw) { $out[$o.OutputKey] = $o.OutputValue }
+foreach ($k in "ApiUrl", "UserPoolClientId", "UiBucketName", "UiDistributionId") {
+    if (-not $out[$k]) { Write-Host "stack output $k missing - aborting UI publish" -ForegroundColor Red; exit 1 }
+}
 
 @"
 const CONFIG = {

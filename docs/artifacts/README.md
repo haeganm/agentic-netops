@@ -25,6 +25,15 @@ Entry 10's `entry_hash` **is** the chain head, which is what the out-of-band SNS
 (ADR 0014). So the claim "this record has not been altered" remains checkable from these files
 alone, against a hash that was mailed out of band while the system was running.
 
+## Note on redaction
+
+These files intentionally keep their original AWS account ID, IAM ARNs, and resource IDs.
+Every ledger entry's hash covers its full content, so redacting any field would make the
+export fail its own `verify_ledger.py` check — the evidence would read as tampered, which is
+the one thing a tamper-evidence artifact must not do. Account IDs are not credentials, the
+resources no longer exist (the stack is torn down to $0), and no secret material was ever
+written to the ledger.
+
 ## Note on lifetime cost
 
 `dynamodb-final-export.json` records `LIMITS#RA used=25` — 25 Reachability Analyzer analyses,

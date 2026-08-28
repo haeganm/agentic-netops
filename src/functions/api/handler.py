@@ -3,7 +3,7 @@ Step Functions task token stored on the incident; everything else is read-only."
 import contextlib
 import json
 
-from shared import ddb, ledger, plan, status
+from shared import ddb, evidence, ledger, plan, status
 from shared.log import log
 
 
@@ -15,12 +15,9 @@ def lambda_handler(event, context):
     actor = claims.get("email")
 
     try:
-        # Every state-changing route must be ATTRIBUTABLE: the actor is compared against
-        # drift_actor for segregation of duties, claimed as first_approver, and written to the
-        # ledger as who authorised a network change. This previously defaulted to the string
-        # "unknown", which meant a token missing the email claim could be recorded as the
-        # approver of a live mutation. Fail closed, and do it by route prefix so a future POST
-        # route inherits the guard instead of having to remember it.
+        # fail closed on attribution: every POST ledgers `actor` as who authorised a network
+        # change, so a token with no email claim is refused. By prefix, so future POST routes
+        # inherit the guard (SECURITY.md pass 4).
         if route.startswith("POST /") and not actor:
             log("unattributable_caller", route=route)
             return _err(403, "unattributable caller: token carries no email claim")
@@ -46,16 +43,13 @@ def lambda_handler(event, context):
             return _cancel(path_params["id"], actor)
 
         if route == "GET /incidents/{id}/verify":
-            # 404 on an unknown id, rather than letting verify_ledger report an empty chain as
-            # {valid: false}: a typo'd id would otherwise be indistinguishable from genuine
-            # tampering, in the one tool whose entire job is telling those two apart.
+            # 404 on an unknown id: an empty chain must never read as tampering
             iid = path_params["id"]
             if not ddb.get_incident(iid):
                 return _err(404, "not found")
             return _ok(ledger.verify_ledger(iid))
 
         if route == "GET /incidents/{id}/evidence":
-            from shared import evidence
             report = evidence.build_report(path_params["id"])
             return _err(404, "not found") if report is None else _ok(report)
 

@@ -66,9 +66,15 @@ Remove-Stack "netops-platform"
 # So the lab stack fails on PathPrivateToPublic / PathPublicToIgw (and then on the route table
 # they transitively pin) until the analyses are cleared. Analyses cost nothing to retain, which is
 # exactly why this went unnoticed -- it is a teardown-completeness bug, not a cost one.
-$analyses = @((aws ec2 describe-network-insights-analyses --query "NetworkInsightsAnalyses[].NetworkInsightsAnalysisId" --output text 2>$null) -split "\s+" | Where-Object { $_ })
+# Scope to the LAB'S OWN paths: an account-wide sweep would also destroy analysis history that
+# belongs to someone else in a shared/sandbox account.
+$labPaths = @((aws cloudformation describe-stack-resources --stack-name netops-lab --query "StackResources[?ResourceType=='AWS::EC2::NetworkInsightsPath'].PhysicalResourceId" --output text 2>$null) -split "\s+" | Where-Object { $_ })
+$analyses = @()
+foreach ($p in $labPaths) {
+    $analyses += @((aws ec2 describe-network-insights-analyses --network-insights-path-id $p --query "NetworkInsightsAnalyses[].NetworkInsightsAnalysisId" --output text 2>$null) -split "\s+" | Where-Object { $_ })
+}
 if ($analyses.Count -gt 0) {
-    Write-Host "clearing $($analyses.Count) Reachability Analyzer analyses (they pin the paths)..."
+    Write-Host "clearing $($analyses.Count) Reachability Analyzer analyses on the lab's paths (they pin the paths)..."
     foreach ($a in $analyses) { aws ec2 delete-network-insights-analysis --network-insights-analysis-id $a 2>&1 | Out-Null }
 }
 Remove-Stack "netops-lab"
@@ -109,6 +115,12 @@ if ($samExists -and $samExists -ne "None") {
 # rebuild fail with "already exists".
 Write-Host "`nchecking the resources whose names are fixed across rebuilds:"
 $acct = aws sts get-caller-identity --query "Account" --output text
+if ($LASTEXITCODE -ne 0 -or -not $acct -or $acct -eq "None") {
+    # without the account id the bucket check probes a name that can't exist and reports a
+    # vacuous "gone" -- the one verification designed to catch survivors would lie
+    Fail "cannot resolve account id - the fixed-name checks below would pass vacuously"
+    $acct = "UNRESOLVED"
+}
 foreach ($check in @(
     @{ what = "bucket netops-platform-ui-$acct"; cmd = { aws s3api head-bucket --bucket "netops-platform-ui-$acct" 2>&1 } },
     @{ what = "log group /aws/apigateway/netops-platform-console";

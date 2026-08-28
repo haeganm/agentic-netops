@@ -163,6 +163,28 @@ read-only, mutating nothing and costing nothing:
 **Result: 18/18 pass.** Together with the recorded 9/9 end-to-end remediation runs, this closes
 the open item without weakening anything in order to test it.
 
+## Pre-open-source pass: oracle failures and the error paths nobody had walked
+
+A final multi-facet pass before the repo went public — state-machine data flow, the ledger's
+consistency model, the console's failure UX, the PowerShell scripts (never audited before),
+and supply-chain pinning. The theme of what it found: **an oracle that RETURNS a bad verdict
+escalated correctly, but an oracle that CRASHED was invisible** — its ASL failure was caught,
+nothing was ledgered, and silence read as clean.
+
+| Severity | Finding | Fix |
+|---|---|---|
+| HIGH | **A crashed oracle read as "oracles clean"** — an RA/probe Lambda failure is caught by the ASL and flows forward with no ledger entry, and the tier derived its escalation signal only from ledgered verdicts. Suppressing an oracle (throttle, revoked IAM) yielded LOW auto-execute with a false "oracles clean" reason in the evidence | Planner synthesizes a `missing` verdict for any ORACLE_POLICY-expected oracle with no ledgered verdict; `missing` escalates like a budget skip. Red-team test `test_J` |
+| HIGH | **Ledger reads were eventually consistent** — governance anchors `verify_ledger`'s result out-of-band immediately after the last append; a stale Query could miss the tail entry, report a false break, and permanently anchor the wrong head. The append CAS loop's stale re-reads also burned its 8 retries against a replica, not real contention | `ConsistentRead=True` on every read feeding the chain, test-pinned |
+| HIGH | **CLI `verify_ledger.py` reported a typo'd id as TAMPERED** — the API's 404 guard was never given to the standalone script the auditor runs | Exit 2 `NOT FOUND`, distinct from exit 1 tampering |
+| MED | **RA `Status=failed` ledgered `reachable:false`** — a failed analysis has no `NetworkPathFound`, so an AWS-side error became evidence of unreachability and routed a correctly-remediated incident to FAILED | Degrades like a timeout: `started:false`, no reachability claim, `VERIFICATION_LIMITED` |
+| MED | **A caught VERIFY-stage RA failure closed `RESOLVED`** — `VerificationScope?` treated an absent `started` (the Catch's `{Error,Cause}` object) as *clean* rather than *unknown*, claiming full verification when the impact oracle never ran | Two Choice rules route the error-object shape to `CloseLimited` |
+| MED | **`inconclusive-timeout` did not escalate** while the epistemically identical `skipped-budget` did | Added to `_BAD_VERDICTS` |
+| MED | **Executor mid-loop failures could corrupt or skip the audit record** — `_resolve` raising escaped with no ledger entry; a ledger failure after a successful mutation re-recorded that op as an `error` (self-contradictory); the inherited 60s timeout could kill the loop with no record at all | `_resolve` inside the ledgered try; the ok-append moved outside it; `Timeout: 180` |
+| MED | **IPv6 blind spot in classification** — `sg-open-world` matched only `0.0.0.0/0`, so a `::/0` ingress in a multi-fault diff misclassified (tier already caught `::/0` independently — the redundant pair is why this wasn't an auto-exec bypass) | `::/0` literal added, test-pinned |
+| MED | **Five scripts reported success after failing** — `restore.ps1` printed "restored." unconditionally; `release_model.ps1` could eval the incumbent and attribute the PASS to a never-deployed candidate; `deploy_ui.ps1` could publish a config.js with empty endpoints; `deploy_lab.ps1` could leave detection suppressed and exit 0; `teardown.ps1` deleted RA analyses account-wide and its survivor check passed vacuously without an account id | Exit-code gates throughout; analysis deletion scoped to the lab's own paths |
+| MED | **Console error paths were unfinished** — reject had no error handling (a SoD 403 left both buttons dead with no message); load failures blanked tabs silently; every re-render of a veto view stacked another countdown interval and refresh timer; logout left timers running | One error surface, symmetric try/catch on every action, single tracked handles for both timers |
+| LOW | **docker-compose images were unpinned `:latest`** while ci.yml SHA-pins its actions with a comment explaining exactly why mutable tags are unsafe | Digest-pinned |
+
 ## Accepted risks (deliberate, not oversights)
 
 - **Encryption at rest uses AWS-owned keys, not a CMK.** The ledger, the SNS anchor topic and
@@ -216,6 +238,28 @@ the open item without weakening anything in order to test it.
   *Close later:* pin to the exact `ModelId` ARN.
 - **CloudTrail is single-region.** Correct by design — the detector consumes only in-region
   EC2 management events.
+- **Safe-first op ordering trades a security-tightening tail for availability.** The planner
+  applies restores before revokes, so a mid-plan failure leaves connectivity restored but an
+  attacker-added rule still live, and `Execute`'s no-retry Catch goes to FAILED without
+  re-driving it (deliberate for a non-idempotent mutation). The exposure persists until the
+  next CloudTrail event re-raises it. *Close later:* a FAILED incident with unapplied
+  revoke ops re-enters DETECT.
+- **RA budget is consumed before the analysis starts.** If `start_network_insights_analysis`
+  itself raises, the counter has already advanced and no `skipped-budget` entry is ledgered —
+  sustained EC2 throttling drains the cap silently. Decrementing on failure would risk the
+  opposite (an uncounted run); the counter errs toward undercounting spend headroom, never
+  overspending.
+- **Native DynamoDB states have Retry but no Catch.** A status-update state exhausting its
+  retries kills the execution at that state, skipping the ledger anchor and leaving a live
+  task token (bounded by the 24h token expiry). Catching a failed `MarkFailed` has no
+  meaningful fallback target; the failure surfaces via the workflow-failed alarm instead.
+- **Probe/drift verdicts are checked for presence, not content, by the tier.** A present
+  `dns:fail` pre-repair is the *expected* broken state, so only oracle-machinery failures
+  (missing/skip/timeout/error verdicts) escalate — data-plane content is adjudicated by
+  the VERIFY-stage Choice rules, not the tier.
+- **ASL poll bounds live in the Lambda (`MAX_POLLS`), not the state machine.** A regression
+  returning `done:false` forever would spin to the 1-year execution limit;
+  `test_statemachine.py` pins the Lambda-side ceiling instead.
 
 ## Live verification after deploy — now scripted
 

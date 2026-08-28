@@ -59,7 +59,8 @@ def classify(diff: list[dict]) -> str:
 
     sgs = [e for e in diff if e["section"] == "sgs"]
     if any(e["kind"] == "extra" and e["field"] == "ingress"
-           and '"cidr": "0.0.0.0/0"' in (e["actual"] or "") for e in sgs):
+           and ('"cidr": "0.0.0.0/0"' in (e["actual"] or "") or '"cidr": "::/0"' in (e["actual"] or ""))
+           for e in sgs):
         return "sg-open-world"
     if any(e["kind"] == "missing" and e["field"] == "ingress" for e in sgs):
         return "sg-ingress-removed"

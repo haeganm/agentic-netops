@@ -58,3 +58,34 @@ def test_inserted_forged_entry_breaks_chain(netops_table):
 def test_empty_incident_is_not_valid(netops_table):
     assert not ledger.verify_ledger("nope")["valid"]
 
+
+
+def test_every_ledger_read_is_strongly_consistent(netops_table, monkeypatch):
+    """Query/GetItem default to eventually-consistent reads. A stale read here manufactures a
+    false tamper alarm -- and governance anchors that wrong head out-of-band, permanently.
+    Every read that feeds the hash chain must pin ConsistentRead=True."""
+    seen = []
+
+    class Spy:
+        def __init__(self, t):
+            self._t = t
+
+        def get_item(self, **kw):
+            seen.append(("get_item", kw.get("ConsistentRead")))
+            return self._t.get_item(**kw)
+
+        def query(self, **kw):
+            seen.append(("query", kw.get("ConsistentRead")))
+            return self._t.query(**kw)
+
+        def __getattr__(self, name):
+            return getattr(self._t, name)
+
+    real = ddb.table
+    monkeypatch.setattr(ddb, "table", lambda: Spy(real()))
+    monkeypatch.setattr(ledger, "table", lambda: Spy(real()))
+
+    ledger.append("c9", "DETECT", "event", "system", {"x": 1})
+    assert ledger.verify_ledger("c9")["valid"]
+    assert seen, "spy never engaged"
+    assert all(cr is True for _, cr in seen), seen

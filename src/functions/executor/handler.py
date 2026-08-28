@@ -37,17 +37,21 @@ def lambda_handler(event, context):
     ec2 = sts_scope.scoped_ec2_client(iid, ops, inventory)
     applied = []
     for op in ops:
-        params = _resolve(ec2, op)
+        params = dict(op["params"])
+        # _resolve and the mutation share one try so a mid-loop failure of EITHER is ledgered
+        # with applied_so_far; the "ok" append sits OUTSIDE it so a successful mutation is
+        # never re-recorded as an error if only the ledger write fails.
         try:
+            params = _resolve(ec2, op)
             getattr(ec2, op["action"])(**params)
-            applied.append(op["action"])
-            ledger.append(iid, "EXECUTE", "tool_call", "system",
-                          {"action": op["action"], "params": params, "result": "ok"})
         except Exception as e:
             ledger.append(iid, "EXECUTE", "tool_call", "system",
                           {"action": op["action"], "params": params,
                            "result": "error", "error": str(e)[:500], "applied_so_far": applied})
             raise
+        applied.append(op["action"])
+        ledger.append(iid, "EXECUTE", "tool_call", "system",
+                      {"action": op["action"], "params": params, "result": "ok"})
     log("executed", incident_id=iid, ops=len(applied))
     return {"applied": applied}
 

@@ -90,7 +90,9 @@
 "use strict";
 let token = sessionStorage.getItem("netops_jwt") || "";
 let currentIncident = null;
-let timer = null;
+let timer = null;          // 15s list poll
+let refreshT = null;       // 10s incident-detail self-refresh (single, never stacked)
+let countdownIv = null;    // veto countdown (single, cleared on every view change)
 
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => {
@@ -100,13 +102,21 @@ const el = (tag, cls, text) => {
   return n;
 };
 
+// one visible error surface for the app view; every loader routes failures here so an API
+// outage reads as a message, not a silently blank tab
+const apperr = el("p");
+apperr.style.cssText = "color:var(--bad);margin:8px 0";
+apperr.hidden = true;
+function showErr(msg) { apperr.textContent = msg || ""; apperr.hidden = !msg; }
+const load = (fn) => fn().then(() => showErr("")).catch((e) => showErr("load failed: " + e.message));
+
 async function api(path, opts = {}) {
   const r = await fetch(CONFIG.apiUrl + path, {
     ...opts,
     headers: {Authorization: "Bearer " + token, "Content-Type": "application/json", ...(opts.headers || {})},
   });
-  if (r.status === 401) { logout(); throw new Error("session expired"); }
-  const body = await r.json();
+  if (r.status === 401) { logout("session expired — sign in again"); throw new Error("session expired"); }
+  const body = await r.json().catch(() => ({}));  // a proxy 5xx body may not be JSON
   if (!r.ok) throw new Error(body.error || r.status);
   return body;
 }
@@ -121,35 +131,39 @@ async function signin() {
       body: JSON.stringify({AuthFlow: "USER_PASSWORD_AUTH", ClientId: CONFIG.clientId,
                             AuthParameters: {USERNAME: $("email").value, PASSWORD: $("password").value}}),
     });
-    const data = await r.json();
-    if (!data.AuthenticationResult) throw new Error(data.message || "sign-in failed");
+    const data = await r.json().catch(() => ({}));  // non-JSON body (proxy error page)
+    if (!data.AuthenticationResult) throw new Error(data.message || "sign-in failed (" + r.status + ")");
     token = data.AuthenticationResult.IdToken;
     sessionStorage.setItem("netops_jwt", token);
     boot();
   } catch (e) { $("err").textContent = e.message; }
 }
 
-function logout() {
+function logout(msg) {
   token = ""; sessionStorage.removeItem("netops_jwt");
-  clearInterval(timer);
+  clearInterval(timer); clearTimeout(refreshT); clearInterval(countdownIv);
+  currentIncident = null;
   $("app").hidden = true; $("nav").hidden = true; $("login").hidden = false;
+  $("err").textContent = msg || "";
 }
 
 function boot() {
   $("login").hidden = true; $("nav").hidden = false; $("app").hidden = false;
+  $("app").prepend(apperr);
   showTab("incidents");
   clearInterval(timer);
-  timer = setInterval(() => { if (!currentIncident) loadIncidents(); }, 15000);
+  timer = setInterval(() => { if (!currentIncident) load(loadIncidents); }, 15000);
 }
 
 function showTab(name) {
   currentIncident = null;
+  clearTimeout(refreshT); clearInterval(countdownIv);
   for (const b of document.querySelectorAll("#nav button[data-tab]"))
     b.classList.toggle("active", b.dataset.tab === name);
   for (const t of ["incidents", "evals", "budget"]) $("tab-" + t).hidden = t !== name;
-  if (name === "incidents") loadIncidents();
-  if (name === "evals") loadEvals();
-  if (name === "budget") loadBudget();
+  if (name === "incidents") load(loadIncidents);
+  if (name === "evals") load(loadEvals);
+  if (name === "budget") load(loadBudget);
 }
 
 async function loadIncidents() {
@@ -182,12 +196,13 @@ async function loadIncidents() {
 
 async function loadIncident(id) {
   currentIncident = id;
+  clearTimeout(refreshT); clearInterval(countdownIv);  // this view owns at most one of each
   const {meta, ledger} = await api("/incidents/" + id);
   const root = $("tab-incidents");
   root.replaceChildren();
 
   const back = el("button", "btn", "< back");
-  back.onclick = () => { currentIncident = null; loadIncidents(); };
+  back.onclick = () => showTab("incidents");  // resets currentIncident AND both timers
   root.append(back);
 
   const head = el("div", "card");
@@ -210,17 +225,24 @@ async function loadIncident(id) {
   const tools = el("div"); tools.style.marginTop = "10px";
   const vb = el("button", "btn", "verify ledger");
   vb.onclick = async () => {
-    const r = await api(`/incidents/${id}/verify`);
-    vb.textContent = r.valid ? `ledger VALID (${r.length} entries)` : `ledger BROKEN @seq ${r.first_break_seq}`;
-    vb.style.color = r.valid ? "var(--good)" : "var(--bad)";
+    // a trust control must never silently no-op: "could not check" and "not checked yet"
+    // have to look different
+    try {
+      const r = await api(`/incidents/${id}/verify`);
+      vb.textContent = r.valid ? `ledger VALID (${r.length} entries)` : `ledger BROKEN @seq ${r.first_break_seq}`;
+      vb.style.color = r.valid ? "var(--good)" : "var(--bad)";
+    } catch (e) { vb.textContent = "verify FAILED: " + e.message; vb.style.color = "var(--bad)"; }
   };
   const eb = el("button", "btn", "download evidence");
   eb.style.marginLeft = "8px";
   eb.onclick = async () => {
-    const r = await api(`/incidents/${id}/evidence`);
-    const blob = new Blob([JSON.stringify(r, null, 2)], {type: "application/json"});
-    const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-    a.download = `evidence-${id}.json`; a.click();
+    try {
+      const r = await api(`/incidents/${id}/evidence`);
+      const blob = new Blob([JSON.stringify(r, null, 2)], {type: "application/json"});
+      const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
+      a.download = `evidence-${id}.json`; a.click();
+      URL.revokeObjectURL(a.href);
+    } catch (e) { alert("evidence export failed: " + e.message); }
   };
   tools.append(vb, eb);
   head.append(tools);
@@ -234,7 +256,10 @@ async function loadIncident(id) {
     facts.append(el("span", "muted", "plan hash")); facts.append(el("span", "", meta.plan_hash || "-"));
     if (meta.drift_actor) { facts.append(el("span", "muted", "caused by")); facts.append(el("span", "", meta.drift_actor)); }
     act.append(facts);
-    const pre = el("pre", "", JSON.stringify(JSON.parse(meta.plan_ops || "[]"), null, 2));
+    let opsTxt;  // unparseable plan_ops must degrade to raw text, not blank the whole view
+    try { opsTxt = JSON.stringify(JSON.parse(meta.plan_ops || "[]"), null, 2); }
+    catch { opsTxt = String(meta.plan_ops); }
+    const pre = el("pre", "", opsTxt);
     pre.style.color = "var(--text)"; pre.style.fontSize = "12px"; pre.style.margin = "10px 0";
     act.append(pre);
     if (meta.plan_rationale || meta.llm_summary) {
@@ -254,8 +279,16 @@ async function loadIncident(id) {
     const ok = el("button", "btn approve", second ? "APPROVE as second party" : "APPROVE - converge to baseline");
     const no = el("button", "btn reject", "reject");
     no.style.marginLeft = "10px";
-    ok.onclick = async () => { ok.disabled = no.disabled = true; try { await api(`/incidents/${id}/approve`, {method: "POST"}); } catch (e) { alert(e.message); } loadIncident(id); };
-    no.onclick = async () => { no.disabled = ok.disabled = true; await api(`/incidents/${id}/reject`, {method: "POST", body: JSON.stringify({reason: "operator reject"})}); loadIncident(id); };
+    // symmetric handling: a 403 (SoD recusal) or 409 must re-enable the buttons and say why,
+    // never leave both dead; the re-render itself can fail too, hence load()
+    const decide = (path, body) => async () => {
+      ok.disabled = no.disabled = true;
+      try { await api(`/incidents/${id}/${path}`, {method: "POST", ...(body ? {body} : {})}); }
+      catch (e) { alert(e.message); ok.disabled = no.disabled = false; }
+      load(() => loadIncident(id));
+    };
+    ok.onclick = decide("approve");
+    no.onclick = decide("reject", JSON.stringify({reason: "operator reject"}));
     act.append(ok, no);
     root.append(act);
   } else if (meta.status === "AUTO_EXEC_PENDING") {
@@ -266,9 +299,14 @@ async function loadIncident(id) {
       const left = Math.max(0, Math.round((new Date(meta.veto_deadline) - new Date()) / 1000));
       cd.textContent = `auto-executing in ~${left}s unless you cancel…`;
     };
-    tick(); const iv = setInterval(tick, 1000);
+    tick(); countdownIv = setInterval(tick, 1000);
     const cancel = el("button", "btn reject", "CANCEL (veto auto-execution)");
-    cancel.onclick = async () => { clearInterval(iv); cancel.disabled = true; try { await api(`/incidents/${id}/cancel`, {method: "POST"}); } catch (e) { alert(e.message); } loadIncident(id); };
+    cancel.onclick = async () => {
+      clearInterval(countdownIv); cancel.disabled = true;
+      try { await api(`/incidents/${id}/cancel`, {method: "POST"}); }
+      catch (e) { alert(e.message); cancel.disabled = false; }
+      load(() => loadIncident(id));
+    };
     act.append(cancel);
     root.append(act);
   }
@@ -288,8 +326,10 @@ async function loadIncident(id) {
   }
   root.append(led);
   if (["DETECTED", "PROVING", "EXECUTING", "AWAITING_APPROVAL",
-       "AWAITING_SECOND_APPROVAL", "AUTO_EXEC_PENDING"].includes(meta.status))
-    setTimeout(() => { if (currentIncident === id) loadIncident(id); }, 10000);
+       "AWAITING_SECOND_APPROVAL", "AUTO_EXEC_PENDING"].includes(meta.status)) {
+    clearTimeout(refreshT);  // one refresh chain per view -- user actions must not stack more
+    refreshT = setTimeout(() => { if (currentIncident === id) load(() => loadIncident(id)); }, 10000);
+  }
 }
 
 async function loadEvals() {

@@ -88,7 +88,7 @@ so multi-fault diffs heal correctly regardless of classification.
 
 ## Engineering evidence
 
-- 147 automated tests, credential-free CI (moto-mocked; `tests/conftest.py` makes real AWS
+- 155 automated tests, credential-free CI (moto-mocked; `tests/conftest.py` makes real AWS
   unreachable), static ASL validation, and a **standing adversarial red-team suite**
   (`tests/test_redteam.py`) that re-checks tier-forcing, plan-tampering, replayed approvals,
   two-party bypass, and ledger-tampering on every run

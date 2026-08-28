@@ -119,6 +119,29 @@ def test_high_for_oracle_skip():
     assert any("oracle" in r for r in reasons)
 
 
+def test_high_for_inconclusive_timeout():
+    """An RA analysis still running at the poll ceiling proved nothing -- the same epistemic
+    state as a budget skip, so it must escalate the same way."""
+    rule = BASELINE["sgs"]["sg-1"]["ingress"][0]
+    diff = [_e("missing", "sgs", "sg-1", "ingress", expected=rule)]
+    ops = plan.build(diff, BASELINE)
+    t, reasons = tier.decide("sg-ingress-removed", ops, diff, [{"verdict": "inconclusive-timeout"}])
+    assert t == tier.HIGH
+    assert any("oracle" in r for r in reasons), reasons
+
+
+def test_high_for_missing_oracle_evidence():
+    """A crashed oracle ledgers nothing. The planner synthesizes {"verdict": "missing"} for an
+    expected-but-absent oracle; absence of evidence must escalate, not read as clean."""
+    rule = BASELINE["sgs"]["sg-1"]["ingress"][0]
+    diff = [_e("missing", "sgs", "sg-1", "ingress", expected=rule)]
+    ops = plan.build(diff, BASELINE)
+    t, reasons = tier.decide("sg-ingress-removed", ops, diff,
+                             [{"verdict": "missing", "oracle": "oracle:impact"}])
+    assert t == tier.HIGH
+    assert any("oracle" in r for r in reasons), reasons
+
+
 def test_dns_disabled_is_low_when_clean():
     diff = [_e("changed", "vpc", "vpc-1", "dns_support", expected=True, actual=False)]
     ops = plan.build(diff, BASELINE)  # modify_vpc_attribute -> additive/enable -> LOW

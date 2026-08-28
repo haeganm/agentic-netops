@@ -44,6 +44,14 @@ def test_sg_open_world_classified_and_reverted():
     assert policy.evaluate(ops, diff, BASELINE, INVENTORY)["verdict"] == "PASS"
 
 
+def test_ipv6_world_open_classified_open_world():
+    """::/0 is exactly as world-open as 0.0.0.0/0. The v4-only literal misrouted this to
+    sg-ingress-removed in a multi-fault diff, spending RA where the class policy says none."""
+    bad = json.dumps({"cidr": "::/0", "from": 22, "proto": "tcp", "to": 22}, sort_keys=True)
+    diff = [_e("extra", "sgs", "sg-1", "ingress", actual=bad)]
+    assert classify.classify(diff) == "sg-open-world"
+
+
 def test_route_deleted_and_blackholed():
     gone = BASELINE["route_tables"]["rtb-1"]["routes"][0]
     diff = [_e("missing", "route_tables", "rtb-1", "routes", expected=gone)]
