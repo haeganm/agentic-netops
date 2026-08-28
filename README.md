@@ -1,5 +1,8 @@
 # Agentic NetOps — a closed-loop AI network remediation platform on AWS
 
+[![ci](https://github.com/haeganm/agentic-netops/actions/workflows/ci.yml/badge.svg)](https://github.com/haeganm/agentic-netops/actions/workflows/ci.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 An autonomous network-operations platform that manages a lab VPC as its production
 network. When the network drifts from declared intent, the platform runs a deliberately
 engineered closed loop:
