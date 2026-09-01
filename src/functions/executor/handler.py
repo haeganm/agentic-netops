@@ -37,46 +37,58 @@ def lambda_handler(event, context):
     ec2 = sts_scope.scoped_ec2_client(iid, ops, inventory)
     applied = []
     for op in ops:
-        params = dict(op["params"])
+        action, params = op["action"], dict(op["params"])
         # _resolve and the mutation share one try so a mid-loop failure of EITHER is ledgered
         # with applied_so_far; the "ok" append sits OUTSIDE it so a successful mutation is
         # never re-recorded as an error if only the ledger write fails.
         try:
-            params = _resolve(ec2, op)
-            getattr(ec2, op["action"])(**params)
+            action, params = _resolve(ec2, op)
+            getattr(ec2, action)(**params)
         except Exception as e:
             ledger.append(iid, "EXECUTE", "tool_call", "system",
-                          {"action": op["action"], "params": params,
+                          {"action": action, "params": params,
                            "result": "error", "error": str(e)[:500], "applied_so_far": applied})
             raise
-        applied.append(op["action"])
+        applied.append(action)
         ledger.append(iid, "EXECUTE", "tool_call", "system",
-                      {"action": op["action"], "params": params, "result": "ok"})
+                      {"action": action, "params": params, "result": "ok"})
     log("executed", incident_id=iid, ops=len(applied))
     return {"applied": applied}
 
 
-def _resolve(ec2, op: dict) -> dict:
-    """Swap logical params for the runtime association ids the revert APIs require.
-    Fails fast (before any mutation) if the association can't be resolved, rather than
-    issuing a malformed call mid-loop."""
-    params = dict(op["params"])
-    if op["action"] == "replace_route_table_association":
+def _resolve(ec2, op: dict) -> tuple[str, dict]:
+    """Swap logical params for the runtime association ids the revert APIs require, returning
+    (action, params) -- the action can change: a subnet that was plainly DISASSOCIATED has no
+    explicit association to replace (only the implicit main-table fallback, which the
+    association.subnet-id filter does not report), so the converge call is associate, not
+    replace. Fails fast (before any mutation) if a NACL association can't be resolved, rather
+    than issuing a malformed call mid-loop."""
+    action, params = op["action"], dict(op["params"])
+    if action == "replace_route_table_association":
         subnet = params.pop("SubnetId")
         rts = ec2.describe_route_tables(
             Filters=[{"Name": "association.subnet-id", "Values": [subnet]}])["RouteTables"]
-        params["AssociationId"] = _find_assoc(rts, "RouteTables", subnet, "RouteTableAssociationId")
-    elif op["action"] == "replace_network_acl_association":
+        assoc = _find_assoc(rts, subnet, "RouteTableAssociationId")
+        if assoc:
+            params["AssociationId"] = assoc
+        else:
+            action = "associate_route_table"
+            params["SubnetId"] = subnet
+    elif action == "replace_network_acl_association":
         subnet = params.pop("SubnetId")
         nacls = ec2.describe_network_acls(
             Filters=[{"Name": "association.subnet-id", "Values": [subnet]}])["NetworkAcls"]
-        params["AssociationId"] = _find_assoc(nacls, "NetworkAcls", subnet, "NetworkAclAssociationId")
-    return params
+        assoc = _find_assoc(nacls, subnet, "NetworkAclAssociationId")
+        if not assoc:
+            # unlike route tables, a subnet always has a live NACL association to replace
+            raise ValueError(f"no association for subnet {subnet} (cannot resolve NetworkAclAssociationId)")
+        params["AssociationId"] = assoc
+    return action, params
 
 
-def _find_assoc(resources: list, _kind: str, subnet: str, id_field: str) -> str:
+def _find_assoc(resources: list, subnet: str, id_field: str) -> str | None:
     for r in resources:
         for a in r.get("Associations", []):
             if a.get("SubnetId") == subnet:
                 return a[id_field]
-    raise ValueError(f"no association for subnet {subnet} (cannot resolve {id_field})")
+    return None

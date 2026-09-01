@@ -79,16 +79,22 @@ def _awaiting(iid, status="AWAITING_APPROVAL", **extra):
 def test_sod_blocks_approver_who_caused_drift(netops_table, monkeypatch):
     ddb.put_config("APPROVERS", {"map": {"op@x.com": "arn:aws:iam::1:user/op"}})
     _awaiting("i5", drift_actor="arn:aws:iam::1:user/op")
-    monkeypatch.setattr(boto3, "client", lambda *a, **k: FakeSfn({}))
+    calls = {}
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: FakeSfn(calls))
     resp = handler.lambda_handler(_req("POST /incidents/{id}/approve", "i5"), None)
     assert resp["statusCode"] == 403 and "segregation" in json.loads(resp["body"])["error"]
+    # the 403 alone can't prove the ORDER of check vs send: a recused approval that still
+    # resumed the workflow would be a real bypass wearing a 403
+    assert "success" not in calls, "SoD 403 but the task token was still completed"
 
 
 def test_two_party_blocks_same_user_twice(netops_table, monkeypatch):
     _awaiting("i6", status="AWAITING_SECOND_APPROVAL", first_approver="op@x.com")
-    monkeypatch.setattr(boto3, "client", lambda *a, **k: FakeSfn({}))
+    calls = {}
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: FakeSfn(calls))
     same = handler.lambda_handler(_req("POST /incidents/{id}/approve", "i6", actor="op@x.com"), None)
     assert same["statusCode"] == 403 and "two-party" in json.loads(same["body"])["error"]
+    assert "success" not in calls, "two-party 403 but the task token was still completed"
 
 
 def test_two_party_allows_distinct_second_approver(netops_table, monkeypatch):
@@ -104,6 +110,20 @@ def test_cancel_vetoes_auto_exec(netops_table, monkeypatch):
     calls = {}
     monkeypatch.setattr(boto3, "client", lambda *a, **k: FakeSfn(calls))
     resp = handler.lambda_handler(_req("POST /incidents/{id}/cancel", "i8"), None)
+    assert resp["statusCode"] == 200 and calls["failure"] == "T"
+
+
+def test_cancel_survives_ledger_append_failure(netops_table, monkeypatch):
+    """Post-commit symmetry with _decide: once the task failure is sent the veto HAS taken
+    effect, so a ledger throttle must not 500 the operator (whose retry would then 409 as
+    'window already closed', reading like the veto was lost)."""
+    _awaiting("i9", status="AUTO_EXEC_PENDING")
+    calls = {}
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: FakeSfn(calls))
+    def boom(*a, **k):
+        raise RuntimeError("ledger contention")
+    monkeypatch.setattr(handler.ledger, "append", boom)
+    resp = handler.lambda_handler(_req("POST /incidents/{id}/cancel", "i9"), None)
     assert resp["statusCode"] == 200 and calls["failure"] == "T"
 
 

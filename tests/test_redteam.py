@@ -1,4 +1,4 @@
-"""Standing adversarial red-team suite (ADR: SECURITY.md A1-A7). Each test is an ATTACK that
+"""Standing adversarial red-team suite (ADR: SECURITY.md A1-A8). Each test is an ATTACK that
 MUST be blocked, run at moto/unit level (credential-free, $0 -- never touches live RA/Bedrock).
 This is security testing as a permanent, measurable artifact, not a one-time audit."""
 import json
@@ -58,6 +58,20 @@ def test_C_plan_tampering_blocked_at_approval(netops_table):
     assert r["statusCode"] == 409 and "integrity" in json.loads(r["body"])["error"]
 
 
+def test_C2_params_only_tampering_blocked_at_approval(netops_table):
+    """Same ACTIONS, different PARAMS: a plan_hash weakened to cover only action names would
+    pass test_C above while letting test_G's exact payload (EnableDnsSupport True->False)
+    through the approve-time integrity check. The hash must be params-sensitive."""
+    good = [{"action": "modify_vpc_attribute", "resource_id": "vpc-1", "params": {"VpcId": "vpc-1", "EnableDnsSupport": {"Value": True}}}]
+    tampered = json.loads(json.dumps(good))
+    tampered[0]["params"]["EnableDnsSupport"]["Value"] = False
+    ddb.create_incident("i", {"status": "AWAITING_APPROVAL", "task_token": "T", "gsi1sk": "1",
+                              "plan_hash": plan.plan_hash(good), "plan_ops": json.dumps(tampered)})
+    r = api.lambda_handler({"routeKey": "POST /incidents/{id}/approve", "pathParameters": {"id": "i"},
+                            "requestContext": {"authorizer": {"jwt": {"claims": {"email": "a@x"}}}}}, None)
+    assert r["statusCode"] == 409 and "integrity" in json.loads(r["body"])["error"]
+
+
 def test_D_replayed_approval_after_resolve_is_409(netops_table):
     ddb.create_incident("i", {"status": "RESOLVED", "gsi1sk": "1"})  # no token, terminal
     r = api.lambda_handler({"routeKey": "POST /incidents/{id}/approve", "pathParameters": {"id": "i"},
@@ -66,13 +80,17 @@ def test_D_replayed_approval_after_resolve_is_409(netops_table):
 
 
 def test_E_two_party_same_user_blocked(netops_table, monkeypatch):
-    monkeypatch.setattr(boto3, "client", lambda *a, **k: FakeSfn())
+    calls = {}
+    monkeypatch.setattr(boto3, "client", lambda *a, **k: FakeSfn(calls))
     good = [{"action": "modify_vpc_attribute", "resource_id": "vpc-1", "params": {"VpcId": "vpc-1", "EnableDnsSupport": {"Value": True}}}]
     ddb.create_incident("i", {"status": "AWAITING_SECOND_APPROVAL", "task_token": "T", "gsi1sk": "1",
                               "plan_hash": plan.plan_hash(good), "plan_ops": json.dumps(good), "first_approver": "a@x"})
     r = api.lambda_handler({"routeKey": "POST /incidents/{id}/approve", "pathParameters": {"id": "i"},
                             "requestContext": {"authorizer": {"jwt": {"claims": {"email": "a@x"}}}}}, None)
     assert r["statusCode"] == 403
+    # the block must happen BEFORE the token send -- a 403 that still resumed the workflow
+    # would be the two-party bypass this test exists to prevent
+    assert "success" not in calls, "403 returned but the task token was completed anyway"
 
 
 def test_F_ledger_tamper_detected(netops_table):

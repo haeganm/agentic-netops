@@ -55,13 +55,21 @@ def canonical_rules(perms: list) -> list[str]:
             out.append(_c({**base, "cidr": r["CidrIpv6"]}))
         for g in p.get("UserIdGroupPairs", []):
             out.append(_c({**base, "sg": g["GroupId"]}))
+        # prefix-list sources too: a rule granted via a customer-managed prefix list (which
+        # can contain 0.0.0.0/0) used to canonicalize to NOTHING, so the drift diffed empty
+        # and the incident closed FALSE_POSITIVE while the rule persisted
+        for pl in p.get("PrefixListIds", []):
+            out.append(_c({**base, "pl": pl["PrefixListId"]}))
     return sorted(out)
 
 
 def canonical_route(r: dict) -> str:
     dest = r.get("DestinationCidrBlock") or r.get("DestinationPrefixListId")
+    # VpcEndpointId included so an op-params dict canonicalizes like the describe output
+    # (which reports endpoint routes under GatewayId) instead of to target null
     target = (r.get("GatewayId") or r.get("NetworkInterfaceId") or r.get("NatGatewayId")
-              or r.get("TransitGatewayId") or r.get("VpcPeeringConnectionId"))
+              or r.get("TransitGatewayId") or r.get("VpcPeeringConnectionId")
+              or r.get("VpcEndpointId"))
     return _c({"dest": dest, "target": target, "state": r.get("State", "active")})
 
 

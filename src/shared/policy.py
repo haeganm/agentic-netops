@@ -22,7 +22,8 @@ ALLOWED_ACTIONS = {
     "revoke_security_group_ingress", "revoke_security_group_egress",
     "create_route", "delete_route", "replace_route",
     "create_network_acl_entry", "delete_network_acl_entry",
-    "replace_route_table_association", "replace_network_acl_association",
+    "replace_route_table_association", "associate_route_table",
+    "replace_network_acl_association",
     "modify_vpc_attribute", "modify_network_interface_attribute",
 }
 
@@ -69,10 +70,29 @@ def evaluate(ops: list[dict], diff: list[dict], baseline: dict, inventory: dict)
     for e in diff:
         key = _cover_key(e["section"], e["resource_id"], e["field"], e.get("expected"), e.get("actual"))
         if key not in covered_fields:
-            violations.append(f"incomplete: drift {e['section']}/{e['resource_id']}/{e['field']} unremediated")
+            if _unsupported_route_restore(e):
+                # honest reason, not a generic "incomplete": the planner deliberately emits
+                # no op for this class (plan._unrestorable_route) because the real API,
+                # modify_vpc_endpoint, is outside the remediation action set
+                violations.append(
+                    f"unsupported: restoring the gateway-VPC-endpoint route on {e['resource_id']} "
+                    "requires modify_vpc_endpoint (outside the remediation action set) -- human required")
+            else:
+                violations.append(f"incomplete: drift {e['section']}/{e['resource_id']}/{e['field']} unremediated")
 
     return {"verdict": "PASS" if not violations else "FAIL",
             "violations": violations, "policy_version": POLICY_VERSION}
+
+
+def _unsupported_route_restore(e: dict) -> bool:
+    if e["section"] != "route_tables" or e["field"] != "routes" or e["kind"] != "missing":
+        return False
+    try:
+        item = json.loads(e["expected"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return False
+    from shared.plan import _unrestorable_route
+    return _unrestorable_route(item)
 
 
 def _cover_key(section: str, resource_id: str, field: str, expected=None, actual=None) -> tuple:
@@ -137,10 +157,11 @@ def _converges(op: dict, baseline: dict) -> tuple[bool, str, set]:
                 f"deletes baseline nacl rule {rule}" if (rule, egress) in have_rules else "",
                 {("nacls", rid, "entries")})
 
-    if action == "replace_route_table_association":
+    if action in ("replace_route_table_association", "associate_route_table"):
         subnet = p.get("SubnetId")
         have = baseline.get("route_tables", {}).get(rid, {}).get("subnets", [])
-        # one op covers the subnet's association drift on BOTH route tables (see _cover_key)
+        # one op covers the subnet's association drift on BOTH route tables (see _cover_key);
+        # associate is the same converge check -- it applies when no association exists
         return (subnet in have, f"subnet {subnet} not associated to {rid} in baseline" if subnet not in have else "",
                 {("route_tables", "subnet", subnet)})
 

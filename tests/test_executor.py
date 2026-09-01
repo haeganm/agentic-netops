@@ -4,49 +4,40 @@ import json
 
 import boto3
 import pytest
-from moto import mock_aws
 
 from functions.executor import handler
 from shared import ddb, plan
 
 
 @pytest.fixture()
-def lab(monkeypatch):
-    monkeypatch.setenv("TABLE_NAME", "netops-test")
-    monkeypatch.setenv("ACCOUNT_ID", "123456789012")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
-    with mock_aws():
-        # remediation role the executor assumes
-        iam = boto3.client("iam")
-        role = iam.create_role(RoleName="RemediationRole",
-                               AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17",
-                                   "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
-                                                  "Action": "sts:AssumeRole"}]}))["Role"]["Arn"]
-        monkeypatch.setenv("REMEDIATION_ROLE_ARN", role)
-        ec2 = boto3.client("ec2")
-        vpc = ec2.create_vpc(CidrBlock="10.42.0.0/24")["Vpc"]["VpcId"]
-        sg = ec2.create_security_group(GroupName="anchor", Description="a", VpcId=vpc)["GroupId"]
-        # drop moto's default all-egress so the SG matches the empty-egress baseline below
-        ec2.revoke_security_group_egress(GroupId=sg, IpPermissions=[
-            {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
-        rt = ec2.describe_route_tables(Filters=[{"Name": "vpc-id", "Values": [vpc]}])["RouteTables"][0]["RouteTableId"]
-        nacl = ec2.describe_network_acls(Filters=[{"Name": "vpc-id", "Values": [vpc]}])["NetworkAcls"][0]["NetworkAclId"]
-        # table
-        boto3.resource("dynamodb").create_table(
-            TableName="netops-test",
-            KeySchema=[{"AttributeName": "pk", "KeyType": "HASH"},
-                       {"AttributeName": "sk", "KeyType": "RANGE"}],
-            AttributeDefinitions=[{"AttributeName": "pk", "AttributeType": "S"},
-                                  {"AttributeName": "sk", "AttributeType": "S"}],
-            BillingMode="PAY_PER_REQUEST")
-        inventory = {"vpc_id": vpc, "sg_ids": [sg], "rt_ids": [rt], "nacl_id": nacl,
-                     "subnet_ids": [], "eni_ids": [], "igw_id": "igw-x"}
-        # baseline: the SG's ingress SHOULD contain the 443 rule (drift removed it)
-        rule = json.dumps({"cidr": "10.42.0.0/24", "from": 443, "proto": "tcp", "to": 443}, sort_keys=True)
-        snap = {"sgs": {sg: {"ingress": [rule], "egress": []}}, "route_tables": {},
-                "nacls": {}, "vpc": {}, "enis": {}}
-        ddb.put_config("BASELINE", {"snapshot": json.dumps(snap), "inventory": json.dumps(inventory)})
-        yield sg
+def lab(netops_table, monkeypatch):
+    # netops_table supplies mock_aws, TABLE_NAME/ACCOUNT_ID/AWS_REGION, and the CANONICAL
+    # table shape (pk/sk + GSI1) -- this fixture used to hand-build a GSI1-less table, the
+    # exact divergence conftest exists to prevent.
+    # NOTE: moto's trust policy here is permissive and moto ignores STS session policies, so
+    # these tests prove orchestration, not role/boundary/session-policy scoping (docs/evals.md).
+    iam = boto3.client("iam")
+    role = iam.create_role(RoleName="RemediationRole",
+                           AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17",
+                               "Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"},
+                                              "Action": "sts:AssumeRole"}]}))["Role"]["Arn"]
+    monkeypatch.setenv("REMEDIATION_ROLE_ARN", role)
+    ec2 = boto3.client("ec2")
+    vpc = ec2.create_vpc(CidrBlock="10.42.0.0/24")["Vpc"]["VpcId"]
+    sg = ec2.create_security_group(GroupName="anchor", Description="a", VpcId=vpc)["GroupId"]
+    # drop moto's default all-egress so the SG matches the empty-egress baseline below
+    ec2.revoke_security_group_egress(GroupId=sg, IpPermissions=[
+        {"IpProtocol": "-1", "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+    rt = ec2.describe_route_tables(Filters=[{"Name": "vpc-id", "Values": [vpc]}])["RouteTables"][0]["RouteTableId"]
+    nacl = ec2.describe_network_acls(Filters=[{"Name": "vpc-id", "Values": [vpc]}])["NetworkAcls"][0]["NetworkAclId"]
+    inventory = {"vpc_id": vpc, "sg_ids": [sg], "rt_ids": [rt], "nacl_id": nacl,
+                 "subnet_ids": [], "eni_ids": [], "igw_id": "igw-x"}
+    # baseline: the SG's ingress SHOULD contain the 443 rule (drift removed it)
+    rule = json.dumps({"cidr": "10.42.0.0/24", "from": 443, "proto": "tcp", "to": 443}, sort_keys=True)
+    snap = {"sgs": {sg: {"ingress": [rule], "egress": []}}, "route_tables": {},
+            "nacls": {}, "vpc": {}, "enis": {}}
+    ddb.put_config("BASELINE", {"snapshot": json.dumps(snap), "inventory": json.dumps(inventory)})
+    yield sg
 
 
 def _authorize_op(sg):
@@ -82,6 +73,23 @@ def test_happy_path_applies_and_verifies(lab):
     # the rule is now present on the SG
     sgs = boto3.client("ec2").describe_security_groups(GroupIds=[lab])["SecurityGroups"]
     assert any(p["FromPort"] == 443 for p in sgs[0]["IpPermissions"])
+
+
+def test_gate_recheck_blocks_when_drift_widened_after_approval(lab):
+    """The re-check's value is the FRESH live diff (handler re-snapshots right before
+    privileged action): drift that appeared after approval makes the approved plan
+    incomplete, and executing an incomplete plan must be refused. Without this test the
+    re-derivation could regress to diff=[] and every other executor test stays green."""
+    ops = [_authorize_op(lab)]
+    ddb.create_incident("i7", {"status": "EXECUTING", "plan_hash": plan.plan_hash(ops), "gsi1sk": "x"})
+    # the world drifts WIDER between approval and execution: a non-baseline egress rule
+    boto3.client("ec2").authorize_security_group_egress(GroupId=lab, IpPermissions=[
+        {"IpProtocol": "tcp", "FromPort": 9999, "ToPort": 9999,
+         "IpRanges": [{"CidrIp": "10.42.0.0/24"}]}])
+    with pytest.raises(ValueError, match="gate re-check failed"):
+        handler.lambda_handler({"incident_id": "i7", "ops": ops}, None)
+    last = json.loads(ddb.query_ledger("i7")[-1]["payload"])
+    assert any("incomplete" in v for v in last["violations"]), last
 
 
 def test_mid_loop_failure_is_ledgered_with_applied_so_far(lab, monkeypatch):
@@ -137,9 +145,26 @@ def test_applied_op_is_never_ledgered_as_error(lab, monkeypatch):
     assert not any(p.get("result") == "error" for p in payloads), payloads
 
 
-def test_resolve_fails_fast_when_no_association(lab):
+def test_resolve_falls_back_to_associate_when_subnet_disassociated(lab):
+    """A plain DisassociateRouteTable (a subscribed EventBridge trigger) leaves the subnet
+    with only the implicit main-table fallback, which the association.subnet-id filter does
+    not report. The old fail-fast here meant a gate-PASSED, human-APPROVED plan died at
+    execute; the converge call for that state is associate, not replace."""
+    ec2 = boto3.client("ec2")
+    vpc = ec2.describe_security_groups(GroupIds=[lab])["SecurityGroups"][0]["VpcId"]
+    subnet = ec2.create_subnet(VpcId=vpc, CidrBlock="10.42.0.0/26")["Subnet"]["SubnetId"]
+    action, params = handler._resolve(ec2, {"action": "replace_route_table_association",
+                                            "resource_id": "rtb-x",
+                                            "params": {"SubnetId": subnet, "RouteTableId": "rtb-x"}})
+    assert action == "associate_route_table"
+    assert params == {"RouteTableId": "rtb-x", "SubnetId": subnet}
+
+
+def test_resolve_fails_fast_when_no_nacl_association(lab):
+    # NACLs keep the fail-fast: a subnet always has a live NACL association, so absence
+    # means the lookup itself is wrong -- never mutate on that
     ec2 = boto3.client("ec2")
     with pytest.raises(ValueError, match="no association"):
-        handler._resolve(ec2, {"action": "replace_route_table_association",
-                               "resource_id": "rtb-x",
-                               "params": {"SubnetId": "subnet-missing", "RouteTableId": "rtb-x"}})
+        handler._resolve(ec2, {"action": "replace_network_acl_association",
+                               "resource_id": "acl-x",
+                               "params": {"SubnetId": "subnet-missing", "NetworkAclId": "acl-x"}})

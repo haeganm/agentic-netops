@@ -71,12 +71,17 @@ def update_incident(incident_id: str, **fields) -> None:
 
 def claim_first_approver(incident_id: str, actor: str) -> bool:
     """Atomically claim the first-approver slot. False = already claimed by someone else,
-    which is what makes two-party control unforgeable under concurrent approvals (ADR 0013)."""
+    which is what makes two-party control unforgeable under concurrent approvals (ADR 0013).
+
+    Re-claim by the SAME actor is allowed: the claim lands before the task-token send, so a
+    transient send failure used to leave the slot taken with the token unconsumed -- every
+    retry (including the same operator's) then 409'd and the incident could only expire.
+    Idempotent re-claim restores liveness without weakening distinctness."""
     try:
         table().update_item(
             Key=incident_key(incident_id),
             UpdateExpression="SET first_approver = :a",
-            ConditionExpression="attribute_not_exists(first_approver)",
+            ConditionExpression="attribute_not_exists(first_approver) OR first_approver = :a",
             ExpressionAttributeValues={":a": actor},
         )
         return True

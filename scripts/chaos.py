@@ -56,6 +56,8 @@ def seed(fault: str, lab: dict) -> None:
                                      CidrBlock="0.0.0.0/0")
     elif fault == "rtb-assoc-swapped":
         assoc = _assoc_for_subnet(ec2, lab["PrivateSubnetId"])
+        if not assoc:
+            raise SystemExit(f"no association found for {lab['PrivateSubnetId']} - lab already drifted?")
         ec2.replace_route_table_association(AssociationId=assoc, RouteTableId=lab["PublicRtId"])
     elif fault == "sg-swapped-on-eni":
         ec2.modify_network_interface_attribute(NetworkInterfaceId=lab["AnchorEniPrivateId"],
@@ -91,30 +93,41 @@ def restore(wait_for_flush: bool = True) -> None:
         print("already at baseline")
         return
     table.put_item(Item={"pk": "CONFIG", "sk": "MODE", "mode": "maintenance"})
-    ec2 = boto3.client("ec2")
-    for op in plan_mod.build(diff, base):
-        params = dict(op["params"])
-        if op["action"] == "replace_route_table_association":
-            params["AssociationId"] = _assoc_for_subnet(ec2, params.pop("SubnetId"))
-        getattr(ec2, op["action"])(**params)
-        print(f"applied {op['action']} on {op['resource_id']}")
-    remaining = base_mod.diff(base, base_mod.snapshot(inventory))
-    print(f"restore complete, residual diff: {len(remaining)}")
-    if wait_for_flush:
-        print(f"  holding detection off {FLUSH_WAIT_S}s while CloudTrail flushes our own changes...")
-        time.sleep(FLUSH_WAIT_S)
-    table.put_item(Item={"pk": "CONFIG", "sk": "MODE", "mode": "normal"})
-    print("  detection re-enabled")
+    # try/finally: a mid-apply crash used to leave MODE=maintenance forever -- the detector
+    # silently ignoring ALL drift from then on, which is this script's worst failure mode.
+    # On failure the residual drift then correctly raises an incident.
+    try:
+        ec2 = boto3.client("ec2")
+        for op in plan_mod.build(diff, base):
+            action, params = op["action"], dict(op["params"])
+            if action == "replace_route_table_association":
+                assoc = _assoc_for_subnet(ec2, params.pop("SubnetId"))
+                if assoc:
+                    params["AssociationId"] = assoc
+                else:
+                    # plainly disassociated: nothing to replace, associate instead
+                    action = "associate_route_table"
+                    params["SubnetId"] = op["params"]["SubnetId"]
+            getattr(ec2, action)(**params)
+            print(f"applied {action} on {op['resource_id']}")
+        remaining = base_mod.diff(base, base_mod.snapshot(inventory))
+        print(f"restore complete, residual diff: {len(remaining)}")
+        if wait_for_flush:
+            print(f"  holding detection off {FLUSH_WAIT_S}s while CloudTrail flushes our own changes...")
+            time.sleep(FLUSH_WAIT_S)
+    finally:
+        table.put_item(Item={"pk": "CONFIG", "sk": "MODE", "mode": "normal"})
+        print("  detection re-enabled")
 
 
-def _assoc_for_subnet(ec2, subnet_id: str) -> str:
+def _assoc_for_subnet(ec2, subnet_id: str) -> str | None:
     rts = ec2.describe_route_tables(
         Filters=[{"Name": "association.subnet-id", "Values": [subnet_id]}])["RouteTables"]
     for rt in rts:
         for a in rt.get("Associations", []):
             if a.get("SubnetId") == subnet_id:
                 return a["RouteTableAssociationId"]
-    raise SystemExit(f"no association found for {subnet_id}")
+    return None
 
 
 def _table():

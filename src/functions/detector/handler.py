@@ -77,6 +77,13 @@ def _handle(record: dict, inventory_ids: set, maintenance: bool, remediation_pre
     if open_incident:
         iid = open_incident["pk"].split("#", 1)[1]
         ledger.append(iid, "DETECT", "event", "system", summary)
+        # Crash recovery must work HERE too, not just on the conditional-put miss below: the
+        # SQS redelivery of the very event whose first attempt died before StartExecution
+        # correlates with the incident that attempt created -- and used to be swallowed,
+        # stranding the incident in DETECTED forever. StartExecution is idempotent by name.
+        if open_incident.get("status") == status.DETECTED:
+            log("detector_recovering_start", incident_id=iid)
+            _start_workflow(iid, lab_touched)
         log("detector_correlated", incident_id=iid, event_name=event_name)
         return
 

@@ -174,7 +174,12 @@ def _cancel(iid: str, actor: str):
             sfn.exceptions.InvalidToken):
         # same three-way catch as _decide: the window may have closed under us
         return _err(409, "veto window already closed")
-    ledger.append(iid, "APPROVE", "approval", "human", {"decision": "cancelled", "actor": actor})
+    # post-commit, same as _decide: the veto already took effect, so a ledger failure must
+    # not turn it into a 500 that reads like the veto was lost
+    try:
+        ledger.append(iid, "APPROVE", "approval", "human", {"decision": "cancelled", "actor": actor})
+    except Exception as e:  # noqa: BLE001 - post-commit, log and continue
+        log("ledger_append_failed", incident_id=iid, stage="APPROVE", error=str(e)[:300])
     log("cancelled", incident_id=iid, actor=actor)
     return _ok({"decision": "cancelled"})
 

@@ -20,7 +20,10 @@ def build(diff: list[dict], baseline: dict) -> list[dict]:
         missing = {json.loads(e["expected"])["dest"]: e for e in entries if e["kind"] == "missing"}
         extra = {json.loads(e["actual"])["dest"]: e for e in entries if e["kind"] == "extra"}
         for dest in missing.keys() & extra.keys():
-            ops.append(_route_op("replace_route", rt_id, json.loads(missing[dest]["expected"])))
+            item = json.loads(missing[dest]["expected"])
+            if _unrestorable_route(item):
+                continue
+            ops.append(_route_op("replace_route", rt_id, item))
             route_replaced.add((rt_id, dest))
 
     for e in diff:
@@ -38,6 +41,14 @@ def build(diff: list[dict], baseline: dict) -> list[dict]:
             if (rid, item.get("dest")) in route_replaced:
                 continue
             if kind == "missing":
+                # A gateway-VPC-endpoint route cannot be re-created by any op this planner
+                # may emit (ec2:CreateRoute takes VpcEndpointId only for GWLB endpoints; the
+                # real API is modify_vpc_endpoint, deliberately outside the action set).
+                # Emit nothing: the gate then blocks the plan with an honest "unsupported"
+                # reason instead of a misleading converge-only failure. Deleting a rogue
+                # endpoint route (the 'extra' side) still works via delete_route.
+                if _unrestorable_route(item):
+                    continue
                 ops.append(_route_op("create_route", rid, item))
             else:
                 ops.append(_route_op("delete_route", rid, item, delete=True))
@@ -81,6 +92,13 @@ def build(diff: list[dict], baseline: dict) -> list[dict]:
     return ops
 
 
+def _unrestorable_route(item: dict) -> bool:
+    """True for routes whose re-creation is outside the remediation action set (see the
+    comment at the create_route call site). policy.evaluate names the same predicate when
+    explaining the resulting block."""
+    return (item.get("target") or "").startswith("vpce-")
+
+
 def plan_hash(ops: list[dict]) -> str:
     return hashlib.sha256(json.dumps(ops, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -96,6 +114,8 @@ def _perm(rule: dict) -> dict:
             perm["IpRanges"] = [{"CidrIp": rule["cidr"]}]
     if rule.get("sg"):
         perm["UserIdGroupPairs"] = [{"GroupId": rule["sg"]}]
+    if rule.get("pl"):
+        perm["PrefixListIds"] = [{"PrefixListId": rule["pl"]}]
     return perm
 
 

@@ -63,6 +63,26 @@ def test_forged_session_name_is_NOT_skipped(table):
     assert len(ddb.list_incidents()) == 1  # incident IS raised
 
 
+def test_redelivery_after_crash_restarts_the_workflow(table, monkeypatch):
+    """A crash between create_incident and StartExecution leaves a DETECTED incident. The SQS
+    redelivery of that same event CORRELATES with it -- and used to be swallowed there,
+    consuming the message and stranding the incident in DETECTED forever. The correlated
+    branch must (re)start the workflow for a still-DETECTED incident; StartExecution is
+    idempotent by execution name so a live workflow is unaffected."""
+    starts = []
+    monkeypatch.setattr(handler, "_start_workflow", lambda iid, touched: starts.append(iid))
+    handler.lambda_handler(_sqs_event(event_id="evt-a"), None)  # creates + "starts"
+    assert len(starts) == 1
+    # the redelivery (same burst, still DETECTED) must start it again, not just ledger
+    handler.lambda_handler(_sqs_event(event_id="evt-a"), None)
+    assert len(starts) == 2 and starts[0] == starts[1]
+    # but once the workflow has moved past DETECTED, a later event gets its own incident
+    # (post-PROVE events are not correlatable) rather than a restart of the old one
+    ddb.update_incident(starts[0], status="PROVING")
+    handler.lambda_handler(_sqs_event(event_id="evt-c"), None)
+    assert len(starts) == 3 and starts[2] != starts[0]
+
+
 def test_post_prove_incident_not_absorbed(table):
     # a second fault after the first has moved past DETECTED gets its OWN incident
     handler.lambda_handler(_sqs_event(event_id="evt-a"), None)

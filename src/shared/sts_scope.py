@@ -18,6 +18,9 @@ ACTION_MAP = {
     "create_network_acl_entry": ("ec2:CreateNetworkAclEntry", "network-acl"),
     "delete_network_acl_entry": ("ec2:DeleteNetworkAclEntry", "network-acl"),
     "replace_route_table_association": ("ec2:ReplaceRouteTableAssociation", "route-table"),
+    # a plain disassociation leaves the subnet with NO explicit association to replace; the
+    # executor falls back to this at runtime (see executor._resolve), so both are granted
+    "associate_route_table": ("ec2:AssociateRouteTable", "route-table"),
     "replace_network_acl_association": ("ec2:ReplaceNetworkAclAssociation", "network-acl"),
     "modify_vpc_attribute": ("ec2:ModifyVpcAttribute", "vpc"),
     "modify_network_interface_attribute": ("ec2:ModifyNetworkInterfaceAttribute", "network-interface"),
@@ -36,9 +39,12 @@ def session_policy(ops: list[dict], inventory: dict | None = None) -> dict:
     for op in ops:
         iam_action, res_type = ACTION_MAP[op["action"]]
         resources = [arn(res_type, op["resource_id"])]
-        if op["action"] == "replace_route_table_association":
+        if op["action"] in ("replace_route_table_association", "associate_route_table"):
             # authorizes against the new RT, the subnet, AND the CURRENT RT (unknown until
             # runtime). Scope to every lab route table + the subnet -- still lab-bounded.
+            # Both IAM actions granted: a replace op degrades to associate at runtime when
+            # the subnet has no explicit association left (executor._resolve).
+            iam_action = ["ec2:ReplaceRouteTableAssociation", "ec2:AssociateRouteTable"]
             resources.append(arn("subnet", op["params"]["SubnetId"]))
             resources += [arn("route-table", rt) for rt in inv.get("rt_ids", [])]
         elif op["action"] == "replace_network_acl_association":

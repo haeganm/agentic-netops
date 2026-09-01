@@ -724,6 +724,7 @@ Resources:
               - ec2:CreateNetworkAclEntry
               - ec2:DeleteNetworkAclEntry
               - ec2:ReplaceRouteTableAssociation
+              - ec2:AssociateRouteTable
               - ec2:ReplaceNetworkAclAssociation
               - ec2:ModifyNetworkInterfaceAttribute
             Resource: "*"
@@ -773,6 +774,7 @@ Resources:
                   - ec2:CreateNetworkAclEntry
                   - ec2:DeleteNetworkAclEntry
                   - ec2:ReplaceRouteTableAssociation
+                  - ec2:AssociateRouteTable
                   - ec2:ReplaceNetworkAclAssociation
                   - ec2:ModifyNetworkInterfaceAttribute
                 Resource: "*"

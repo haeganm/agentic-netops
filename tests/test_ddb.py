@@ -23,6 +23,17 @@ def test_list_incidents_newest_first(netops_table):
     assert [i["pk"] for i in ddb.list_incidents()] == ["INCIDENT#b", "INCIDENT#a"]
 
 
+def test_first_approver_reclaim_is_idempotent_for_same_actor(netops_table):
+    """The claim lands BEFORE the task-token send, so a transient send failure used to leave
+    the slot taken with the token unconsumed -- every retry 409'd and the incident could only
+    expire. Same-actor re-claim restores liveness; distinctness is untouched."""
+    ddb.create_incident("i", {"status": "AWAITING_APPROVAL", "gsi1sk": "1"})
+    assert ddb.claim_first_approver("i", "a@x") is True
+    assert ddb.claim_first_approver("i", "a@x") is True   # retry after a failed send
+    assert ddb.claim_first_approver("i", "b@x") is False  # two-party control intact
+    assert ddb.get_incident("i")["first_approver"] == "a@x"
+
+
 def test_ra_budget_fail_closed_and_cap(netops_table):
     # no counter item at all -> refuse (fail-closed)
     assert not ddb.consume_ra_budget()

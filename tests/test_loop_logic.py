@@ -103,6 +103,54 @@ def test_gate_passes_association_swap_across_two_route_tables():
     assert policy.evaluate(ops, diff, base, inv)["verdict"] == "PASS"
 
 
+def test_prefix_list_ingress_rule_is_visible_drift():
+    """A rule granted via a PrefixListIds source used to canonicalize to NOTHING: the diff
+    came back empty and the incident closed FALSE_POSITIVE while the (possibly world-open,
+    if the prefix list contains 0.0.0.0/0) rule persisted. It must diff as extra, plan a
+    revoke that names the prefix list, and pass the gate."""
+    from shared import baseline as base_mod
+    canon = base_mod.canonical_rules([{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+                                       "PrefixListIds": [{"PrefixListId": "pl-evil"}]}])
+    assert canon, "prefix-list rule canonicalized to nothing"
+    live = json.loads(json.dumps(BASELINE))
+    live["sgs"]["sg-1"]["ingress"] += canon
+    diff = base_mod.diff(BASELINE, live)
+    assert [e["kind"] for e in diff] == ["extra"]
+    ops = plan.build(diff, BASELINE)
+    assert ops[0]["action"] == "revoke_security_group_ingress"
+    assert ops[0]["params"]["IpPermissions"][0]["PrefixListIds"] == [{"PrefixListId": "pl-evil"}]
+    assert policy.evaluate(ops, diff, BASELINE, INVENTORY)["verdict"] == "PASS"
+
+
+VPCE_ROUTE = json.dumps({"dest": "pl-63a5400a", "state": "active", "target": "vpce-1"}, sort_keys=True)
+
+
+def test_gateway_endpoint_route_blocks_with_honest_reason():
+    """Restoring a gateway-VPC-endpoint route is outside the action set (create_route takes
+    VpcEndpointId only for GWLB endpoints; the real API is modify_vpc_endpoint). The planner
+    must emit NO op for it and the gate must say 'unsupported ... human required' -- not the
+    old misleading converge-only failure from an op the executor could never apply."""
+    base = json.loads(json.dumps(BASELINE))
+    base["route_tables"]["rtb-1"]["routes"].append(VPCE_ROUTE)
+    diff = [_e("missing", "route_tables", "rtb-1", "routes", expected=VPCE_ROUTE)]
+    ops = plan.build(diff, base)
+    assert ops == []
+    verdict = policy.evaluate(ops, diff, base, INVENTORY)
+    assert verdict["verdict"] == "FAIL"
+    assert any("unsupported" in v and "human required" in v for v in verdict["violations"])
+    assert not any("converge-only" in v for v in verdict["violations"])
+
+
+def test_rogue_gateway_endpoint_route_is_still_deletable():
+    # only RE-CREATION is unsupported; stripping an endpoint route someone added works
+    rogue = json.dumps({"dest": "pl-99", "state": "active", "target": "vpce-9"}, sort_keys=True)
+    diff = [_e("extra", "route_tables", "rtb-1", "routes", actual=rogue)]
+    ops = plan.build(diff, BASELINE)
+    assert ops == [{"action": "delete_route", "resource_id": "rtb-1",
+                    "params": {"RouteTableId": "rtb-1", "DestinationPrefixListId": "pl-99"}}]
+    assert policy.evaluate(ops, diff, BASELINE, INVENTORY)["verdict"] == "PASS"
+
+
 def test_dns_disabled():
     diff = [_e("changed", "vpc", "vpc-1", "dns_support", expected=True, actual=False)]
     assert classify.classify(diff) == "dns-disabled"
@@ -207,9 +255,12 @@ def test_session_policy_association_includes_subnet(monkeypatch):
              "field": "subnets", "expected": "subnet-1", "actual": None}]
     ops = plan.build(diff, BASELINE)
     pol = sts_scope.session_policy(ops, INVENTORY)
-    res = next(s["Resource"] for s in pol["Statement"] if s["Action"] == "ec2:ReplaceRouteTableAssociation")
-    assert "arn:aws:ec2:us-east-1:111122223333:route-table/rtb-1" in res
-    assert "arn:aws:ec2:us-east-1:111122223333:subnet/subnet-1" in res
+    stmt = next(s for s in pol["Statement"] if "ec2:ReplaceRouteTableAssociation" in s["Action"])
+    # both actions granted: the executor degrades replace -> associate at runtime when the
+    # subnet was plainly disassociated (no explicit association left to replace)
+    assert "ec2:AssociateRouteTable" in stmt["Action"]
+    assert "arn:aws:ec2:us-east-1:111122223333:route-table/rtb-1" in stmt["Resource"]
+    assert "arn:aws:ec2:us-east-1:111122223333:subnet/subnet-1" in stmt["Resource"]
 
 
 def test_session_policy_eni_modify_includes_sgs(monkeypatch):
