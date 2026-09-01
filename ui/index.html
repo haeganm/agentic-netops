@@ -377,7 +377,7 @@ async function loadBudget() {
 
 $("signin").onclick = signin;
 $("password").addEventListener("keydown", (e) => { if (e.key === "Enter") signin(); });
-$("logout").onclick = logout;
+$("logout").onclick = () => logout();  // not bound directly: logout(msg) would print the click event
 for (const b of document.querySelectorAll("#nav button[data-tab]"))
   b.onclick = () => showTab(b.dataset.tab);
 if (token) boot();
