@@ -90,6 +90,7 @@
 "use strict";
 let token = sessionStorage.getItem("netops_jwt") || "";
 let currentIncident = null;
+let lastDecided = {id: null, at: 0};  // suppresses live-looking buttons rendered from stale meta right after a decision
 let timer = null;          // 15s list poll
 let refreshT = null;       // 10s incident-detail self-refresh (single, never stacked)
 let countdownIv = null;    // veto countdown (single, cleared on every view change)
@@ -132,7 +133,9 @@ async function signin() {
                             AuthParameters: {USERNAME: $("email").value, PASSWORD: $("password").value}}),
     });
     const data = await r.json().catch(() => ({}));  // non-JSON body (proxy error page)
-    if (!data.AuthenticationResult) throw new Error(data.message || "sign-in failed (" + r.status + ")");
+    if (!data.AuthenticationResult) throw new Error(data.message
+      || (data.ChallengeName ? "sign-in challenge " + data.ChallengeName + " — ask an admin to re-set your password (create_user.ps1)"
+                             : "sign-in failed (" + r.status + ")"));
     token = data.AuthenticationResult.IdToken;
     sessionStorage.setItem("netops_jwt", token);
     boot();
@@ -187,7 +190,7 @@ async function loadIncidents() {
     const td = el("td");
     td.append(el("span", "pill s-" + (i.status || ""), i.status || "?"));
     tr.append(td);
-    tr.onclick = () => loadIncident(id);
+    tr.onclick = () => load(() => loadIncident(id));  // via load(): a failed fetch must surface, not silently freeze the poll
     tbl.append(tr);
   }
   card.append(tbl);
@@ -198,6 +201,7 @@ async function loadIncident(id) {
   currentIncident = id;
   clearTimeout(refreshT); clearInterval(countdownIv);  // this view owns at most one of each
   const {meta, ledger} = await api("/incidents/" + id);
+  if (currentIncident !== id) return;  // a newer click won the race -- don't render a stale incident over it
   const root = $("tab-incidents");
   root.replaceChildren();
 
@@ -240,8 +244,10 @@ async function loadIncident(id) {
       const r = await api(`/incidents/${id}/evidence`);
       const blob = new Blob([JSON.stringify(r, null, 2)], {type: "application/json"});
       const a = document.createElement("a"); a.href = URL.createObjectURL(blob);
-      a.download = `evidence-${id}.json`; a.click();
-      URL.revokeObjectURL(a.href);
+      a.download = `evidence-${id}.json`;
+      document.body.append(a); a.click(); a.remove();
+      // deferred: a synchronous revoke races the download start on WebKit (silent no-op)
+      setTimeout(() => URL.revokeObjectURL(a.href), 1000);
     } catch (e) { alert("evidence export failed: " + e.message); }
   };
   tools.append(vb, eb);
@@ -283,13 +289,21 @@ async function loadIncident(id) {
     // never leave both dead; the re-render itself can fail too, hence load()
     const decide = (path, body) => async () => {
       ok.disabled = no.disabled = true;
-      try { await api(`/incidents/${id}/${path}`, {method: "POST", ...(body ? {body} : {})}); }
+      try {
+        await api(`/incidents/${id}/${path}`, {method: "POST", ...(body ? {body} : {})});
+        lastDecided = {id, at: Date.now()};  // workflow is advancing; stale meta may still say AWAITING for a few seconds
+      }
       catch (e) { alert(e.message); ok.disabled = no.disabled = false; }
       load(() => loadIncident(id));
     };
     ok.onclick = decide("approve");
     no.onclick = decide("reject", JSON.stringify({reason: "operator reject"}));
-    act.append(ok, no);
+    if (lastDecided.id === id && Date.now() - lastDecided.at < 15000) {
+      ok.disabled = no.disabled = true;
+      act.append(ok, no, el("p", "muted", "decision recorded — refreshing…"));
+    } else {
+      act.append(ok, no);
+    }
     root.append(act);
   } else if (meta.status === "AUTO_EXEC_PENDING") {
     const act = planCard("LOW-TIER AUTO-EXECUTE — cancel to veto");
