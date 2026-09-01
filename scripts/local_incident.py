@@ -13,14 +13,18 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 from shared import classify, plan, policy
 
-INVENTORY = {"vpc_id": "vpc-1", "sg_ids": ["sg-anchor", "sg-probe"], "rt_ids": ["rtb-pub"],
+INVENTORY = {"vpc_id": "vpc-1", "sg_ids": ["sg-anchor", "sg-probe"], "rt_ids": ["rtb-pub", "rtb-priv"],
              "nacl_id": "acl-1", "subnet_ids": ["subnet-pub", "subnet-priv"],
              "eni_ids": ["eni-priv"], "igw_id": "igw-1"}
 
+# Two route tables, like the real lab (lab/template.yaml): an association swap drifts BOTH --
+# 'missing' on the subnet's baseline table and 'extra' on the other. With only one table
+# monitored, the swap shows up as an unplannable bare 'extra' and the gate correctly blocks it.
 BASELINE = {
     "sgs": {"sg-anchor": {"ingress": [json.dumps({"cidr": "10.42.0.0/24", "from": 443, "proto": "tcp", "to": 443}, sort_keys=True)], "egress": []},
             "sg-probe": {"ingress": [], "egress": [json.dumps({"cidr": "0.0.0.0/0", "from": 443, "proto": "tcp", "to": 443}, sort_keys=True)]}},
-    "route_tables": {"rtb-pub": {"routes": [json.dumps({"dest": "0.0.0.0/0", "state": "active", "target": "igw-1"}, sort_keys=True)], "subnets": ["subnet-pub"]}},
+    "route_tables": {"rtb-pub": {"routes": [json.dumps({"dest": "0.0.0.0/0", "state": "active", "target": "igw-1"}, sort_keys=True)], "subnets": ["subnet-pub"]},
+                     "rtb-priv": {"routes": [], "subnets": ["subnet-priv"]}},
     "nacls": {"acl-1": {"entries": [], "subnets": ["subnet-priv"]}},
     "vpc": {"vpc-1": {"dns_support": True, "dns_hostnames": True}},
     "enis": {"eni-priv": {"sgs": ["sg-probe"]}},
@@ -41,7 +45,9 @@ def mutate(live: dict, fault: str) -> None:
     elif fault == "nacl-deny-inserted":
         live["nacls"]["acl-1"]["entries"] = [json.dumps({"action": "deny", "cidr": "0.0.0.0/0", "egress": True, "from": None, "proto": "-1", "rule": 50, "to": None}, sort_keys=True)]
     elif fault == "rtb-assoc-swapped":
+        # mirrors chaos.py: the private subnet's association is repointed at the public table
         live["route_tables"]["rtb-pub"]["subnets"] = ["subnet-pub", "subnet-priv"]
+        live["route_tables"]["rtb-priv"]["subnets"] = []
     elif fault == "sg-swapped-on-eni":
         live["enis"]["eni-priv"]["sgs"] = ["sg-anchor"]
     elif fault == "dns-disabled":
