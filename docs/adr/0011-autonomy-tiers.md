@@ -1,6 +1,6 @@
 # ADR 0011: Deterministic autonomy tiers (auto / approve / two-party)
 
-**Status**: accepted (2026-07-24)
+**Status**: accepted (2026-07-24); consequences table corrected (2026-09-01, see note below)
 
 ## Context
 "Always require a human approval" is safe but crude — it wastes a human on a routine
@@ -33,8 +33,17 @@ to MEDIUM, halting all no-human execution instantly.
 ## Consequences
 - Across the 9 fault classes: routine restores (sg-ingress-removed, sg-egress-removed,
   route-deleted, dns-disabled) → LOW; posture changes (route-blackholed, nacl-deny,
-  rtb-assoc-swapped, sg-swapped-on-eni) → MEDIUM; sg-open-world (+ unknown/multi/oracle-fail)
-  → HIGH. A clean, defensible spread.
-- The auto-execute path is a new attack surface, analyzed in docs/SECURITY.md (A1–A7) and
+  sg-swapped-on-eni) → MEDIUM; rtb-assoc-swapped and sg-open-world (+ unknown/multi/
+  oracle-fail) → HIGH. A clean, defensible spread.
+- The auto-execute path is a new attack surface, analyzed in docs/SECURITY.md (A1–A8) and
   covered by the standing red-team suite. The tier reasons are ledgered and appear in the
   compliance evidence export.
+
+**Correction (2026-09-01)** — the table above originally listed rtb-assoc-swapped as MEDIUM.
+It actually routes **HIGH**: a real association swap drifts *both* route tables (the subnet
+leaves one and appears on the other), so the >1-resource broad-blast-radius rule fires —
+reproduced with `tier.decide` on the two-entry diff and pinned by
+`tests/test_tier.py::test_association_swap_is_high_broad_blast_radius`. The code is the
+intended behavior (this module's stated design is that misclassification may only
+*over*-escalate); the table was the stale artifact. Corrected in place rather than silently:
+in the lab this means the swap demo needs two operators, not one.

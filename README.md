@@ -68,8 +68,9 @@ so multi-fault diffs heal correctly regardless of classification.
   Reachability Analyzer path endpoints are **free unattached ENIs** (verified).
 - RA is the only metered oracle: **hard-capped in code** (DynamoDB atomic counter,
   fail-closed; ADR 0005). Past the cap incidents close as `VERIFICATION_LIMITED`.
-- A $10 monthly budget with email alerts, plus 3 CloudWatch alarms (change-DLQ depth,
-  RA-budget-exhausted, workflow failed) and 7-day log retention on every function.
+- A $10 monthly budget with email alerts, plus 4 CloudWatch alarms (change-DLQ depth,
+  API-403 burst, RA-budget-exhausted, workflow failed) and 7-day log retention on every
+  function.
 - See `docs/costs.md` for the per-unit economics and the running actuals.
 
 ## Governance & assurance
@@ -91,15 +92,17 @@ so multi-fault diffs heal correctly regardless of classification.
 
 ## Engineering evidence
 
-- 155 automated tests, credential-free CI (moto-mocked; `tests/conftest.py` makes real AWS
-  unreachable), static ASL validation, and a **standing adversarial red-team suite**
+- A credential-free pytest suite (179 tests at the 2026-09 audit; moto-mocked, and
+  `tests/conftest.py` installs bogus static credentials so any stray real-AWS call fails
+  authentication), static ASL validation, and a **standing adversarial red-team suite**
   (`tests/test_redteam.py`) that re-checks tier-forcing, plan-tampering, replayed approvals,
   two-party bypass, and ledger-tampering on every run
 - **Adversarially audited three times**: IAM/STS/gate/wallet + injection/auth +
   infra/supply-chain; an attack-surface analysis of the auto-execute path (A1–A8); and a pass on
   the identity/authorization perimeter run against the **deployed** stack — see
   `docs/SECURITY.md`. Highlights: an independent (non-tautological) policy gate, a tag-scoped
-  remediation boundary proven 18/18 by `scripts/verify_boundary.py`, config-as-trust-boundary
+  remediation boundary proven action-by-action by `scripts/verify_boundary.py` (18/18 at the
+  last live run; the action set has since gained `ec2:AssociateRouteTable`), config-as-trust-boundary
   IAM, an exact-identity detector guard, and segregation of duties as full recusal (ADR 0016)
 - 16 ADRs including live-verified IAM/platform facts — start with `docs/adr/README.md`;
   conventions (error-handling policy, single-sources-of-truth) in `docs/conventions.md`
@@ -120,29 +123,37 @@ so multi-fault diffs heal correctly regardless of classification.
 
 ## Run it
 
-**Prerequisites:** an AWS account + credentials (`aws sts get-caller-identity` must work),
-AWS SAM CLI ≥ 1.163, Python 3.12+, PowerShell (Windows PowerShell 5.1 or
+**Prerequisites:** an AWS account + credentials (`aws sts get-caller-identity` must work)
+with **Bedrock model access enabled for Amazon Nova in us-east-1** (without it the loop
+still heals — the LLM is advisory — but every diagnosis is empty and the console shows
+"llm agrees: -"),
+AWS SAM CLI ≥ 1.163, Python 3.12+ (CI runs 3.12 — the Lambda runtime — and 3.13 is
+verified locally; note `sam build` wants a `python3.12` binary, so a 3.13-only machine
+needs `sam build --use-container`, which needs Docker), PowerShell (Windows PowerShell 5.1 or
 [PowerShell 7 / `pwsh`](https://github.com/PowerShell/PowerShell) — the scripts run on
 Windows, macOS, and Linux), and Docker (only for `dev.ps1`'s local parity stack).
-Everything deploys to `us-east-1`; the stack names are set in `samconfig.toml`.
+Everything deploys to `us-east-1`. `samconfig.toml` names the platform stack
+(`netops-platform`); the lab stack name `netops-lab` is hardcoded in the deploy/teardown
+scripts (overridable via the `LAB_STACK` env var in `chaos.py`/`seed_baseline.py`).
 
 The commands below are written Windows-style. On macOS/Linux run the same `.ps1` scripts
 under `pwsh`, and wherever a command says `.venv\Scripts\python`, use `.venv/bin/python`
 (the venv layout differs per OS; the scripts themselves detect it).
 
 ```powershell
-python -m venv .venv; .venv\Scripts\python -m pip install -r requirements-dev.txt
+python -m venv .venv; .venv\Scripts\python -m pip install -r requirements-dev.txt   # macOS/Linux: python3 -m venv .venv
 .\scripts\check.ps1                                # ruff + pytest + cfn-lint + sam validate
-.\scripts\deploy_lab.ps1                           # lab VPC (the drift target) + baseline
+.\scripts\deploy_lab.ps1                           # lab VPC. First run warns "platform stack not up yet" - expected
 .\scripts\deploy_platform.ps1                      # platform stack
+.venv\Scripts\python scripts\seed_baseline.py      # NOW capture the baseline (the lab deploy ran before the table existed)
 .\scripts\deploy_ui.ps1                            # console (prints its URL)
 
 # Operators. You need TWO NON-ADMIN operators to exercise HIGH-tier two-party approval.
 # Why non-admin: segregation of duties blocks whoever CAUSED the drift from approving the fix,
 # and chaos.py runs as your admin identity -- so an operator mapped to that admin ARN is
 # blocked from approving every seeded fault, leaving too few eligible approvers for two-party.
-.\scripts\create_user.ps1 -Email opsA@x.com -Password <12+ chars>
-.\scripts\create_user.ps1 -Email opsB@x.com -Password <12+ chars>
+.\scripts\create_user.ps1 -Email opsA@x.com -Password <12+ chars, upper+lower+digit>
+.\scripts\create_user.ps1 -Email opsB@x.com -Password <12+ chars, upper+lower+digit>
 
 # Optionally map YOUR admin identity to an operator account, purely to see the SoD block fire:
 # that account will then be refused on anything you break yourself (403), which is the point.
@@ -229,7 +240,9 @@ on the bill it checks.
 
 ```powershell
 $env:NETOPS_ALERT_EMAIL = "you@example.com"
-.\scripts\restore.ps1 -OperatorPassword "<12+ chars>"          # lab + platform + seed + UI + 1 operator
+# -OperatorEmail matters: without it restore.ps1 creates the operator under the ALERT email,
+# and the --approver mapping two lines down would name an account that doesn't exist
+.\scripts\restore.ps1 -OperatorEmail opsA@x.com -OperatorPassword "<12+ chars, upper+lower+digit>"
 .\scripts\create_user.ps1 -Email opsB@x.com -Password "<...>"  # second operator: HIGH tier needs two
 .venv\Scripts\python scripts\seed_baseline.py --approver opsA@x.com=arn:aws:iam::<acct>:user/<you>
 ```

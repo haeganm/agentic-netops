@@ -2,7 +2,7 @@
 
 Read in this order for the shape of the system: **0001** (why a closed loop at all), **0003**
 (what "intended state" means), **0004** (the gate that bounds every repair), **0011** (who has
-to sign off), **0014** (why the record can be trusted).
+to sign off), **0016** (who may NOT sign off), **0014** (why the record can be trusted).
 
 | # | Decision | Why it matters |
 |---|---|---|
@@ -21,7 +21,6 @@ to sign off), **0014** (why the record can be trusted).
 | [0013](0013-two-party-sod.md) | Two-party approval and segregation of duties | The drift-causer can't approve their own fix; HIGH needs two distinct humans |
 | [0014](0014-hash-chained-ledger.md) | Tamper-evident hash-chained decision ledger | Any alteration/insertion/deletion is detectable at an exact sequence number; the head is anchored out-of-band |
 | [0015](0015-compliance-evidence-export.md) | Per-incident compliance evidence export | Six control assertions, each backed by concrete evidence — including the ledger's own integrity |
-
 | [0016](0016-sod-is-recusal-not-approval-only.md) | Segregation of duties means recusal, not "cannot approve" | The drift-causer is removed from every decision on their own change — approve, reject and veto |
 
 All are `accepted`. None is fully superseded, but three were **corrected** after being

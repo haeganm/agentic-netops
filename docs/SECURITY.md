@@ -67,7 +67,7 @@ adversarially; each vector and its neutralization:
 
 The standing `tests/test_redteam.py` suite re-checks A1/A3-family blocks plus plan-tampering,
 replayed approvals, two-party bypass, kill-switch enforcement, and ledger tampering on every CI
-run — nine attacks, each asserting the block, not the happy path.
+run — ten attacks, each asserting the block, not the happy path.
 
 ## Regressions found by live testing, and why the test suite missed them
 
@@ -209,6 +209,17 @@ nothing was ledgered, and silence read as clean.
   own CloudTrail consumption covers the change-detection role Config would play here.
 - **Cognito advanced security (threat protection) is off** — no compromised-credential
   detection or adaptive auth. It moves the pool to a paid tier.
+- **Gateway-VPC-endpoint routes cannot be auto-restored** (found by the 2026-09 audit). Both
+  lab route tables' baselines include the S3 gateway-endpoint prefix-list route; if it is
+  removed live (`modify-vpc-endpoint --remove-route-table-ids`), no op in the remediation
+  action set can re-create it — `ec2:CreateRoute` takes `VpcEndpointId` only for GWLB
+  endpoints, and the real API (`modify_vpc_endpoint`) is deliberately excluded rather than
+  widening the IAM surface for an edge case. The planner emits no op for that entry and the
+  gate blocks the plan with an explicit `unsupported: … human required` reason (previously a
+  misleading `converge-only` failure). Deleting a *rogue* endpoint route still works. Note
+  the blast radius while the drift persists: PROVE diffs the whole lab, so **every**
+  concurrent incident's plan blocks human-required until the endpoint route is restored by
+  hand — an honest fleet-wide fail-closed, not a targeted one.
 
 - ~~**No segregation of duties on approval.**~~ **CLOSED (ADR 0013):** HIGH-tier incidents
   require two distinct approvers (maker-checker); an approver mapped (via `CONFIG#APPROVERS`)

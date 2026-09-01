@@ -1,4 +1,4 @@
-﻿# Compliance evidence - incident cd5ead973ec1
+# Compliance evidence - incident cd5ead973ec1
 - status: **RESOLVED** | fault: sg-ingress-removed | MTTR: 132s
 - ledger entries: 10
 

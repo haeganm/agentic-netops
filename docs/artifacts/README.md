@@ -25,6 +25,15 @@ Entry 10's `entry_hash` **is** the chain head, which is what the out-of-band SNS
 (ADR 0014). So the claim "this record has not been altered" remains checkable from these files
 alone, against a hash that was mailed out of band while the system was running.
 
+## Note on encoding (normalized 2026-09-01)
+
+As captured (via PowerShell redirection), each file began with a UTF-8 BOM, which makes a
+plain `json.load()` fail — the first thing an auditor does. The BOM (exactly 3 leading
+bytes per file) was stripped on 2026-09-01; nothing else changed. This cannot affect the
+evidence: the hash chain covers ledger *entry content*, not file bytes, and the full chain
+was replayed from the export before and after the strip — 10 entries, head
+`ae492236b06f89ff…`, identical both times and matching the head recorded below.
+
 ## Note on redaction
 
 These files intentionally keep their original AWS account ID, IAM ARNs, and resource IDs.

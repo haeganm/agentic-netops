@@ -11,7 +11,10 @@ API. So it validates *the loop*, not the API's authorization path.
 That is not a theoretical limitation. A 9/9 green run has coexisted with **every approval in the
 console returning 500** (an IAM narrowing on `states:SendTask*` that denied implicitly — see
 `docs/SECURITY.md`). Unit tests couldn't catch it either, since they stub the Step Functions
-client and never evaluate IAM.
+client and never evaluate IAM. The same caveat covers the EXECUTE stage: moto ignores STS
+session policies and the test fixture's trust policy is permissive, so the executor unit tests
+prove orchestration (hash lock, gate re-check, ledgering), never the role ∩ boundary ∩
+session-policy scoping — that is what `scripts/verify_boundary.py` exists for.
 
 So: a green eval means the remediation loop works. It does **not** mean a human can approve
 anything. Plan-integrity re-hashing, segregation of duties, and two-party distinctness are
@@ -27,8 +30,10 @@ Scores:
 - **cost** — RA analyses × $0.10
 
 Release gate (`scripts/release_model.ps1`): a candidate `ModelId` deploys only if
-**diagnosed ≥ 8/9 and remediated = 9/9**. Remediation must be perfect because it never
-depends on the LLM — a remediation failure is a platform bug, not a model regression.
+**det_correct = 9/9, diagnosed ≥ 8/9 and remediated = 9/9** (all three parsed from
+`evaluate.py`'s `RESULT` line and enforced by the script). Remediation must be perfect
+because it never depends on the LLM — a remediation failure is a platform bug, not a model
+regression; a det_correct miss means the harness itself is broken.
 
 | Run (UTC) | Model | det | diagnosed | remediated | mean MTTR | notes |
 |---|---|---|---|---|---|---|
