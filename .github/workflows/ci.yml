@@ -40,6 +40,10 @@ jobs:
       - uses: aws-actions/setup-sam@f84ec7d548307efafe33230528756de3c5841a17 # v2
         with:
           use-installer: true
+          # pinned like the action SHAs above: with no version the installer fetches
+          # LATEST sam at run time, so CI could break on an upstream release with zero
+          # repo change
+          version: "1.165.0"
       - name: sam validate
         run: sam validate --lint
         env:
