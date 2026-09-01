@@ -18,8 +18,12 @@ os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
 os.environ["AWS_SECURITY_TOKEN"] = "testing"
 os.environ["AWS_SESSION_TOKEN"] = "testing"
 os.environ["AWS_DEFAULT_REGION"] = "us-east-1"
-os.environ.pop("AWS_PROFILE", None)
-os.environ.pop("DDB_ENDPOINT", None)
+# pop every env var that could redirect a stray call somewhere real: profiles, endpoint
+# overrides, and credential/config file paths -- not just AWS_PROFILE
+for var in ("AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_SHARED_CREDENTIALS_FILE",
+            "AWS_CONFIG_FILE", "DDB_ENDPOINT",
+            *[v for v in os.environ if v.startswith("AWS_ENDPOINT_URL")]):
+    os.environ.pop(var, None)
 
 TABLE_NAME = "netops-test"
 
@@ -114,7 +118,11 @@ class FakeSfn:
 
 @pytest.fixture()
 def fake_sfn(monkeypatch):
-    """Patch boto3.client so handlers get FakeSfn; yields the shared calls dict."""
+    """Patch boto3.client so handlers get FakeSfn; yields the shared calls dict.
+
+    This replaces boto3.client for EVERY service, which is safe only because shared/ddb.py
+    goes through boto3.resource -- if a handler ever switches to a low-level DynamoDB client,
+    it would silently receive FakeSfn here."""
     import boto3
 
     fake = FakeSfn()

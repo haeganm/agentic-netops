@@ -183,7 +183,10 @@ def test_every_terminal_outcome_anchors_the_ledger():
     cancelled remediation is exactly the history worth erasing (ADR 0014)."""
     for name in TERMINAL_STATUS_STATES:
         nxt = STATES[name]["Next"]
-        assert nxt.startswith("AnchorLedger"), f"{name} terminates without anchoring (-> {nxt})"
+        # exact names, not a prefix: a hypothetical "AnchorLedgerSkipped" state would have
+        # satisfied startswith() while anchoring nothing
+        assert nxt in ("AnchorLedger", "AnchorLedgerOnFail"), \
+            f"{name} terminates without anchoring (-> {nxt})"
 
 
 def test_asl_statuses_match_shared_status_module():
@@ -198,8 +201,11 @@ def test_asl_statuses_match_shared_status_module():
             written.add(vals[":s"]["S"])
     assert written, "found no status writes -- the extractor is broken, not the ASL"
     assert written <= status.ALL, f"ASL writes undeclared statuses: {written - status.ALL}"
-    # and every terminal status the module declares must actually be reachable
-    assert written & status.TERMINAL, "no terminal status is written by the workflow"
+    # converse: every declared status must have a writer. The ASL writes these; the detector
+    # writes DETECTED and governance's store_token writes the AWAITING_DECISION waits. A
+    # member nothing writes is the MEASURING bug (status.py docstring) all over again.
+    writable = written | {status.DETECTED} | set(status.AWAITING_DECISION)
+    assert writable == status.ALL, f"declared statuses nothing writes: {status.ALL - writable}"
 
 
 def test_verification_limited_is_reachable():

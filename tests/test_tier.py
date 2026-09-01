@@ -142,6 +142,21 @@ def test_high_for_missing_oracle_evidence():
     assert any("oracle" in r for r in reasons), reasons
 
 
+def test_association_swap_is_high_broad_blast_radius():
+    """A real rtb-assoc-swapped drifts BOTH route tables (the subnet leaves one and appears on
+    the other), so the >1-resource rule escalates it to HIGH -- two-party, not the single
+    approval ADR 0011 originally tabled. The ADR was amended (2026-09-01) to match the code:
+    tier.py documents over-escalation as the intended fail-closed direction."""
+    base = {**BASELINE, "route_tables": {"rtb-1": {"routes": [], "subnets": ["subnet-1"]},
+                                         "rtb-2": {"routes": [], "subnets": ["subnet-2"]}}}
+    diff = [_e("missing", "route_tables", "rtb-1", "subnets", expected="subnet-1"),
+            _e("extra", "route_tables", "rtb-2", "subnets", actual="subnet-1")]
+    ops = plan.build(diff, base)
+    t, reasons = tier.decide("rtb-assoc-swapped", ops, diff, CLEAN)
+    assert t == tier.HIGH
+    assert any("blast radius" in r for r in reasons), reasons
+
+
 def test_dns_disabled_is_low_when_clean():
     diff = [_e("changed", "vpc", "vpc-1", "dns_support", expected=True, actual=False)]
     ops = plan.build(diff, BASELINE)  # modify_vpc_attribute -> additive/enable -> LOW

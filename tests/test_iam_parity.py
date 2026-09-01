@@ -62,6 +62,17 @@ def test_gate_and_scoper_action_sets_match():
     assert set(sts_scope.ACTION_MAP) == policy.ALLOWED_ACTIONS
 
 
+def test_action_map_keys_are_real_ec2_methods():
+    """The map's KEYS are a fourth copy of the vocabulary: chaos.py --restore and the executor
+    both do getattr(ec2_client, action), so every key must be a live boto3 method name.
+    Client construction is local -- no credentials or network involved."""
+    import boto3
+    ec2 = boto3.client("ec2", region_name="us-east-1",
+                       aws_access_key_id="x", aws_secret_access_key="x")
+    missing = [k for k in sts_scope.ACTION_MAP if not hasattr(ec2, k)]
+    assert not missing, f"ACTION_MAP keys that are not ec2 client methods: {missing}"
+
+
 def test_iam_matches_scoper():
     """Every mutating ec2 action the scoper can emit must be grantable, and vice versa."""
     scoper = {v[0] for v in sts_scope.ACTION_MAP.values()}
