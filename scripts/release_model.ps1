@@ -2,7 +2,7 @@
 # the full eval suite. Usage: .\scripts\release_model.ps1 -ModelId us.amazon.nova-lite-v1:0
 param([Parameter(Mandatory)][string]$ModelId)
 $ErrorActionPreference = "Continue"
-$py = ".venv\Scripts\python"
+. (Join-Path $PSScriptRoot "common.ps1")
 
 # capture the CURRENTLY-deployed model so rollback restores THAT, not the template default
 $prev = aws cloudformation describe-stacks --stack-name netops-platform --query "Stacks[0].Parameters[?ParameterKey=='ModelId'].ParameterValue" --output text
@@ -19,7 +19,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $env:MODEL_ID = $ModelId
-$out = & $py scripts\evaluate.py 2>&1 | Tee-Object -Variable evalOut
+$out = & $py scripts/evaluate.py 2>&1 | Tee-Object -Variable evalOut
 $result = ($evalOut | Select-String "^RESULT").ToString()
 if ($result -match "diagnosed=(\d+)/(\d+) remediated=(\d+)/(\d+)") {
     $diag = [int]$Matches[1]; $total = [int]$Matches[2]; $rem = [int]$Matches[3]

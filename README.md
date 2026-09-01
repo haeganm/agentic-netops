@@ -121,8 +121,14 @@ so multi-fault diffs heal correctly regardless of classification.
 ## Run it
 
 **Prerequisites:** an AWS account + credentials (`aws sts get-caller-identity` must work),
-AWS SAM CLI ≥ 1.163, Python 3.12, PowerShell, and Docker (only for `dev.ps1`'s local parity
-stack). Everything deploys to `us-east-1`; the stack names are set in `samconfig.toml`.
+AWS SAM CLI ≥ 1.163, Python 3.12+, PowerShell (Windows PowerShell 5.1 or
+[PowerShell 7 / `pwsh`](https://github.com/PowerShell/PowerShell) — the scripts run on
+Windows, macOS, and Linux), and Docker (only for `dev.ps1`'s local parity stack).
+Everything deploys to `us-east-1`; the stack names are set in `samconfig.toml`.
+
+The commands below are written Windows-style. On macOS/Linux run the same `.ps1` scripts
+under `pwsh`, and wherever a command says `.venv\Scripts\python`, use `.venv/bin/python`
+(the venv layout differs per OS; the scripts themselves detect it).
 
 ```powershell
 python -m venv .venv; .venv\Scripts\python -m pip install -r requirements-dev.txt

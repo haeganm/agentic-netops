@@ -17,9 +17,11 @@ const CONFIG = {
   region: "us-east-1",
   clientId: "$($out.UserPoolClientId)",
 };
-"@ | Out-File -Encoding utf8 ui\config.js
+"@ | Out-File -Encoding utf8 ui/config.js
 
-aws s3 cp ui\index.html "s3://$($out.UiBucketName)/index.html" --content-type "text/html" | Out-Null
-aws s3 cp ui\config.js "s3://$($out.UiBucketName)/config.js" --content-type "application/javascript" | Out-Null
+# forward slashes: these paths are ARGUMENTS to aws.exe, and on macOS/Linux pwsh passes a
+# backslash through literally (only PowerShell's own cmdlets normalize separators)
+aws s3 cp ui/index.html "s3://$($out.UiBucketName)/index.html" --content-type "text/html" | Out-Null
+aws s3 cp ui/config.js "s3://$($out.UiBucketName)/config.js" --content-type "application/javascript" | Out-Null
 aws cloudfront create-invalidation --distribution-id $out.UiDistributionId --paths "/*" | Out-Null
 Write-Host "console live at $($out.UiUrl)" -ForegroundColor Green
