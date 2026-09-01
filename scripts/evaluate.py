@@ -140,7 +140,9 @@ def main():
 
     print(f"\n| {now} | {model_id} | {det}/{total} | {diagnosed}/{total} | "
           f"{remediated}/{total} | {mean_mttr}s | ${cost} |")
-    print(f"RESULT diagnosed={diagnosed}/{total} remediated={remediated}/{total} mean_mttr={mean_mttr}")
+    # det is IN the RESULT line so release_model.ps1 can gate on it (evals.md: must be 9/9)
+    print(f"RESULT det={det}/{total} diagnosed={diagnosed}/{total} "
+          f"remediated={remediated}/{total} mean_mttr={mean_mttr}")
 
 
 if __name__ == "__main__":

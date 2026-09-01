@@ -19,16 +19,27 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 $env:MODEL_ID = $ModelId
-$out = & $py scripts/evaluate.py 2>&1 | Tee-Object -Variable evalOut
-$result = ($evalOut | Select-String "^RESULT").ToString()
-if ($result -match "diagnosed=(\d+)/(\d+) remediated=(\d+)/(\d+)") {
-    $diag = [int]$Matches[1]; $total = [int]$Matches[2]; $rem = [int]$Matches[3]
-    if ($diag -ge ($total - 1) -and $rem -eq $total) {
-        Write-Host "GATE PASS ($diag/$total diagnosed, $rem/$total remediated) - $ModelId released" -ForegroundColor Green
+# no assignment on the pipeline: capturing Tee-Object's passthrough silenced the live eval
+# output, so the operator watched ~20 minutes of nothing
+& $py scripts/evaluate.py 2>&1 | Tee-Object -Variable evalOut
+$resultLine = $evalOut | Select-String "^RESULT" | Select-Object -First 1
+if (-not $resultLine) {
+    # a crashed evaluate.py must read as "nothing was proven", not a null-reference error
+    Write-Host "GATE FAIL - evaluate.py emitted no RESULT line (crashed or was interrupted)" -ForegroundColor Red
+} elseif ("$resultLine" -match "det=(\d+)/(\d+) diagnosed=(\d+)/(\d+) remediated=(\d+)/(\d+)") {
+    $det = [int]$Matches[1]; $total = [int]$Matches[2]
+    $diag = [int]$Matches[3]; $rem = [int]$Matches[5]
+    # all three gates from docs/evals.md: det 9/9 (harness sanity), diagnosis >= 8/9,
+    # remediation 9/9 (never depends on the model, so a miss is a platform bug)
+    if ($det -eq $total -and $diag -ge ($total - 1) -and $rem -eq $total) {
+        Write-Host "GATE PASS (det $det/$total, diagnosed $diag/$total, remediated $rem/$total) - $ModelId released" -ForegroundColor Green
         exit 0
     }
+    Write-Host "GATE FAIL ($resultLine)" -ForegroundColor Red
+} else {
+    Write-Host "GATE FAIL - RESULT line did not parse: $resultLine" -ForegroundColor Red
 }
-Write-Host "GATE FAIL - rolling back to $prev" -ForegroundColor Red
+Write-Host "rolling back to $prev" -ForegroundColor Red
 sam deploy --parameter-overrides "ModelId=$prev" | Out-Null
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ROLLBACK FAILED - the failing candidate $ModelId is still deployed" -ForegroundColor Red

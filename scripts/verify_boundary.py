@@ -1,5 +1,5 @@
-"""Prove the tag-scoped remediation boundary live -- the check docs/SECURITY.md has demanded
-since it was written, and ADR 0010 still lists as open.
+"""Prove the tag-scoped remediation boundary live -- the check docs/SECURITY.md demanded
+since it was written (the ADR 0010 open item it closed on 2026-07-25).
 
   python scripts/verify_boundary.py        # read-only, mutates nothing, costs nothing
 

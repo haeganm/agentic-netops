@@ -7,3 +7,8 @@ $venvBin = if ($env:OS -eq "Windows_NT") { Join-Path $repoRoot ".venv/Scripts" }
            else { Join-Path $repoRoot ".venv/bin" }
 $py = Join-Path $venvBin $(if ($env:OS -eq "Windows_NT") { "python.exe" } else { "python" })
 $cfnLint = Join-Path $venvBin $(if ($env:OS -eq "Windows_NT") { "cfn-lint.exe" } else { "cfn-lint" })
+
+# Every entry point is written repo-root-relative, and sam build/deploy require that cwd
+# anyway (samconfig.toml, CodeUri src/). Anchoring here makes the scripts work when run
+# from any directory instead of failing on the first relative path.
+Set-Location $repoRoot

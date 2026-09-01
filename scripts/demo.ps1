@@ -4,7 +4,13 @@ param([string]$Fault = "sg-ingress-removed")
 $ErrorActionPreference = "Continue"
 . (Join-Path $PSScriptRoot "common.ps1")
 
+# guarded like create_user.ps1: without this, a missing platform stack seeded the fault
+# anyway and then polled `--table-name ""` forever
 $t = aws cloudformation describe-stacks --stack-name netops-platform --query "Stacks[0].Outputs[?OutputKey=='TableName'].OutputValue" --output text
+if ($LASTEXITCODE -ne 0 -or -not $t -or $t -eq "None") {
+    Write-Host "cannot resolve TableName from netops-platform - is the platform stack deployed (and the region us-east-1)?" -ForegroundColor Red
+    exit 1
+}
 $ui = aws cloudformation describe-stacks --stack-name netops-platform --query "Stacks[0].Outputs[?OutputKey=='UiUrl'].OutputValue" --output text
 
 # must match shared.status.TERMINAL -- omitting one makes a correct outcome poll forever
@@ -29,6 +35,7 @@ Write-Host "  HIGH   -> AWAITING_APPROVAL, then AWAITING_SECOND_APPROVAL: a SECO
 $vals = New-TemporaryFile
 @{ ":p" = @{ S = "INC" }; ":t" = @{ S = $seedIso } } | ConvertTo-Json -Compress | Set-Content $vals
 
+Write-Host "(silence for the first 1-3 minutes is normal: CloudTrail delivery latency)" -ForegroundColor DarkGray
 $last = ""
 try {
     while ($true) {

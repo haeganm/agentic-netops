@@ -3,6 +3,8 @@
 Usage:
   python scripts/seed_baseline.py                  # full seed: baseline + RA limits + MODE=normal
   python scripts/seed_baseline.py --mode maintenance   # only flip the detector mode
+  python scripts/seed_baseline.py --autonomy manual    # kill-switch: no LOW-tier auto-execute
+  python scripts/seed_baseline.py --approver a@x.com=arn:aws:iam::ACCT:user/a   # SoD mapping
 """
 import argparse
 import json
@@ -50,9 +52,17 @@ def main():
               + ("  (LOW-tier auto-execute disabled)" if args.autonomy == "manual" else ""))
         return
     if args.approver:
-        mapping = dict(pair.split("=", 1) for pair in args.approver)
+        for pair in args.approver:
+            if "=" not in pair:
+                raise SystemExit(f"--approver expects EMAIL=IAM_ARN, got {pair!r}")
+        new = dict(pair.split("=", 1) for pair in args.approver)
+        # MERGE into the existing map: a replace here silently un-mapped every operator not
+        # named on this invocation, quietly disabling segregation of duties for them
+        existing = (table.get_item(Key={"pk": "CONFIG", "sk": "APPROVERS"})
+                    .get("Item", {}) or {}).get("map", {})
+        mapping = {**existing, **new}
         table.put_item(Item={"pk": "CONFIG", "sk": "APPROVERS", "map": mapping})
-        print(f"APPROVERS seeded: {sorted(mapping)}")
+        print(f"APPROVERS updated: {sorted(new)} (full map now: {sorted(mapping)})")
         return
 
     lab = stack_outputs(LAB_STACK)

@@ -22,8 +22,13 @@ if ($LASTEXITCODE -ne 0) { $failed += "pytest" }
 & $cfnLint lab/template.yaml
 if ($LASTEXITCODE -ne 0) { $failed += "cfn-lint(lab)" }
 
-sam validate --lint
-if ($LASTEXITCODE -ne 0) { $failed += "sam validate" }
+# CommandNotFound leaves $LASTEXITCODE untouched, so a missing sam used to read as green
+if (Get-Command sam -ErrorAction SilentlyContinue) {
+    sam validate --lint
+    if ($LASTEXITCODE -ne 0) { $failed += "sam validate" }
+} else {
+    $failed += "sam validate (sam CLI not installed)"
+}
 
 if ($failed.Count -gt 0) {
     Write-Host "`nFAILED: $($failed -join ', ')" -ForegroundColor Red

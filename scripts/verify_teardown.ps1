@@ -19,9 +19,26 @@ $rows = @()
 function Check($what, $ok, $detail) {
     $script:rows += [pscustomobject]@{ ok = [bool]$ok; what = $what; detail = "$detail" }
 }
-function Count($expr) { $v = (& $expr 2>$null | Out-String).Trim(); if ($v -eq "" -or $v -eq "None") { "0" } else { $v } }
+# A failed CLI call is NOT zero: mapping errors to "0 found" made an expired session or a
+# denied region render a vacuous "all clean" from the one script whose job is proving $0.
+# "ERROR(cli)" never equals "0"/""/None, so every comparison below fails the check loudly.
+function Count($expr) {
+    $v = (& $expr 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { return "ERROR(cli)" }
+    if ($v -eq "" -or $v -eq "None") { "0" } else { $v }
+}
+function Text($expr) {
+    $v = (& $expr 2>$null | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) { "ERROR(cli)" } else { $v }
+}
 
 $acct = (aws sts get-caller-identity --query "Account" --output text 2>$null)
+if ($LASTEXITCODE -ne 0 -or -not $acct -or $acct -eq "None") {
+    # same guard teardown.ps1 has: without it the fixed-name bucket check probes an
+    # impossible name and passes vacuously
+    Check "account id resolvable" $false "sts get-caller-identity failed - fixed-name checks below are unreliable"
+    $acct = "UNRESOLVED"
+}
 Write-Host "account $acct -- verifying teardown`n"
 
 # ---- 1. the stacks -----------------------------------------------------------------------------
@@ -31,10 +48,10 @@ foreach ($s in @("netops-platform", "netops-lab", "aws-sam-cli-managed-default")
 }
 
 # ---- 2. storage and state ----------------------------------------------------------------------
-$buckets = (aws s3api list-buckets --query "Buckets[?contains(Name,'netops') || contains(Name,'sam-cli')].Name" --output text 2>$null | Out-String).Trim()
+$buckets = Text { aws s3api list-buckets --query "Buckets[?contains(Name,'netops') || contains(Name,'sam-cli')].Name" --output text }
 Check "S3 buckets" ($buckets -eq "") $(if ($buckets) { $buckets } else { "none" })
 
-$tables = (aws dynamodb list-tables --query "TableNames[?contains(@,'netops')]" --output text 2>$null | Out-String).Trim()
+$tables = Text { aws dynamodb list-tables --query "TableNames[?contains(@,'netops')]" --output text }
 Check "DynamoDB tables" ($tables -eq "") $(if ($tables) { $tables } else { "none" })
 
 # on-demand backups outlive their table and keep billing
@@ -57,7 +74,7 @@ Check "Cognito user pools" ($pools -eq "0") "$pools found"
 $topics = Count { aws sns list-topics --query "length(Topics[?contains(TopicArn,'netops')])" --output text }
 Check "SNS topics" ($topics -eq "0") "$topics found"
 
-$queues = (aws sqs list-queues --queue-name-prefix netops --query "QueueUrls" --output text 2>$null | Out-String).Trim()
+$queues = Text { aws sqs list-queues --queue-name-prefix netops --query "QueueUrls" --output text }
 Check "SQS queues" ($queues -eq "" -or $queues -eq "None") $(if ($queues -and $queues -ne "None") { "present" } else { "none" })
 
 $rules = Count { aws events list-rules --name-prefix netops --query "length(Rules)" --output text }
@@ -98,20 +115,21 @@ foreach ($r in $regions) {
     $n = Count { aws ec2 describe-nat-gateways --region $r --query "length(NatGateways[?State!='deleted'])" --output text }
     $v = Count { aws ec2 describe-volumes --region $r --query "length(Volumes)" --output text }
     $s = Count { aws ec2 describe-snapshots --region $r --owner-ids self --query "length(Snapshots)" --output text }
-    if ("$i$e$n$v$s" -match "[1-9]") { $dirty += "${r}: instances=$i eips=$e nat=$n volumes=$v snapshots=$s" }
+    # ERROR matters as much as a nonzero count: an unqueryable region is unproven, not clean
+    if ("$i$e$n$v$s" -match "[1-9]|ERROR") { $dirty += "${r}: instances=$i eips=$e nat=$n volumes=$v snapshots=$s" }
 }
 Check "EC2/EBS/EIP/NAT across $($regions.Count) regions" ($dirty.Count -eq 0) $(if ($dirty) { $dirty -join "; " } else { "all clean" })
 
-$kms = (aws kms list-aliases --query "Aliases[?starts_with(AliasName,'alias/') && !starts_with(AliasName,'alias/aws/')].AliasName" --output text 2>$null | Out-String).Trim()
+$kms = Text { aws kms list-aliases --query "Aliases[?starts_with(AliasName,'alias/') && !starts_with(AliasName,'alias/aws/')].AliasName" --output text }
 Check "customer-managed KMS keys" ($kms -eq "") $(if ($kms) { $kms } else { "none (`$1/mo each)" })
 
-$secrets = (aws secretsmanager list-secrets --query "SecretList[].Name" --output text 2>$null | Out-String).Trim()
+$secrets = Text { aws secretsmanager list-secrets --query "SecretList[].Name" --output text }
 Check "Secrets Manager secrets" ($secrets -eq "") $(if ($secrets) { $secrets } else { "none" })
 
 # ---- 6. the tripwire must SURVIVE --------------------------------------------------------------
 # Asserted as a positive: if everything above is wrong, this budget is what tells you.
-$bud = (aws budgets describe-budgets --account-id $acct --query "Budgets[].BudgetName" --output text 2>$null | Out-String).Trim()
-Check "a budget alarm still exists (tripwire)" ($bud -ne "") $(if ($bud) { $bud -replace "\s+", ", " } else { "NONE - nothing would warn you" })
+$bud = Text { aws budgets describe-budgets --account-id $acct --query "Budgets[].BudgetName" --output text }
+Check "a budget alarm still exists (tripwire)" ($bud -ne "" -and $bud -ne "ERROR(cli)") $(if ($bud) { $bud -replace "\s+", ", " } else { "NONE - nothing would warn you" })
 
 # ---- report ------------------------------------------------------------------------------------
 $w = ($rows.what | Measure-Object -Maximum -Property Length).Maximum
